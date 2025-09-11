@@ -484,25 +484,23 @@ def get_individuals(role: Optional[str] = None) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"fetch_error:{e}", "individuals": []}
 
-# ---------- Canonical fetch tool (IDs -> full content) ----------
+# ---------- Canonical fetch tool (single id -> full content) ----------
 
 @mcp.tool()
-def fetch(ids: List[str]) -> Dict[str, Any]:
+def fetch(id: str) -> Dict[str, Any]:
     """
     Canonical fetch for ChatGPT connectors.
-    Given exhibit IDs, return full documents/content for each.
+    Given a single exhibit ID, return full document content and metadata.
     """
-    out: List[Dict[str, Any]] = []
-    for eid in ids or []:
-        res = fetch_exhibit(eid)
-        if not res.get("ok"):
-            out.append({"id": eid, "ok": False, "error": res.get("error", "fetch_failed")})
-            continue
-        pages = res.get("pages", []) or []
-        content = "\n\n".join(pages) if isinstance(pages, list) else str(pages)
-        meta = {k: v for k, v in res.items() if k in ("exhibit_id", "description", "filename")}
-        out.append({"id": res.get("exhibit_id", eid), "ok": True, "content": content, "metadata": meta})
-    return {"ok": True, "documents": out}
+    if not id:
+        return {"ok": False, "error": "missing_id"}
+    res = fetch_exhibit(id)
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error", "fetch_failed"), "id": id}
+    pages = res.get("pages", []) or []
+    content = "\n\n".join(pages) if isinstance(pages, list) else str(pages)
+    meta = {k: v for k, v in res.items() if k in ("exhibit_id", "description", "filename")}
+    return {"ok": True, "id": res.get("exhibit_id", id), "content": content, "metadata": meta}
 
 # ---------- Utility/Info Tools ----------
 
@@ -511,7 +509,7 @@ def list_capabilities() -> Dict[str, Any]:
     """Enumerate tool names & brief descriptions."""
     tools = [
         {"name": "search", "desc": "Canonical search: returns IDs + snippets"},
-        {"name": "fetch", "desc": "Canonical fetch: returns full content by IDs"},
+        {"name": "fetch", "desc": "Canonical fetch: returns full content by ID"},
         {"name": "edge_search", "desc": "Edge Function search (hybrid/vector/bm25)"},
         {"name": "search_legal", "desc": "Hybrid search with snippets"},
         {"name": "bm25_search", "desc": "BM25-only search via Edge Function"},
