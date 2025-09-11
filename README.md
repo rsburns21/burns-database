@@ -29,3 +29,5 @@ Security:
 Notes:
 - Server exports `app` (ASGI). Do not self-run in cloud; workflow starts `uvicorn server:app`.
 - Outbound `ALLOWLIST_HOSTS` restricts HTTP calls; configure as needed.
+- Supabase tables use lowercase column names (e.g. `exhibit_id`); server queries were updated to match and avoid empty results.
+- See [`docs/enhancement_plan.md`](docs/enhancement_plan.md) for a roadmap of future improvements and best‑practice guidance.

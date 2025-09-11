@@ -270,7 +270,8 @@ async def label_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         desc, fname = "", ""
         if _supabase and ex:
             try:
-                q = _supabase.table("exhibits").select("description, filename").eq("Exhibit_ID", _normalize_exhibit_id(ex))
+                # Supabase uses lowercase column names; ensure we query accordingly
+                q = _supabase.table("exhibits").select("description, filename").eq("exhibit_id", _normalize_exhibit_id(ex))
                 resp = q.limit(1).execute()
                 if resp.data:
                     desc = (resp.data[0] or {}).get("description") or ""
@@ -321,7 +322,7 @@ def fetch_exhibit(exhibit_id: str) -> Dict[str, Any]:
         pages.append(buf)
     meta = {"exhibit_id": eid}
     try:
-        meta_resp = _supabase.table("exhibits").select("description,filename").eq("Exhibit_ID", eid).limit(1).execute()
+        meta_resp = _supabase.table("exhibits").select("description,filename").eq("exhibit_id", eid).limit(1).execute()
         if meta_resp.data:
             meta.update({k: v for k, v in meta_resp.data[0].items() if k in ("description", "filename")})
     except Exception:
@@ -335,13 +336,13 @@ def list_exhibits(withLabels: bool = False) -> Dict[str, Any]:
         return {"ok": False, "error": "supabase_client_not_initialized", "exhibits": []}
     try:
         data = (_supabase.table("exhibits")
-                .select("Exhibit_ID,description,filename")
+                .select("exhibit_id,description,filename")
                 .execute()).data or []
     except Exception as e:
         return {"ok": False, "error": f"fetch_error:{e}", "exhibits": []}
     out = []
     for rec in data:
-        ex = rec.get("Exhibit_ID")
+        ex = rec.get("exhibit_id")
         item = {"exhibit_id": ex, "description": rec.get("description", "")}
         if withLabels:
             item["category"] = _categorize_exhibit(rec.get("description", ""), rec.get("filename", ""))
