@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastmcp import FastMCP
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 # ---------------------------
@@ -633,8 +634,27 @@ async def edge_action(params: EdgeActionParams) -> Dict[str, Any]:
 # ---------------------------
 
 def build_app():
-    # Important: On fastmcp==2.12.x, http_app() has no path argument.
-    return mcp.http_app()
+    # Build a FastAPI app and mount MCP under /mcp; add HTTP /health
+    app = FastAPI()
+
+    # HTTP /health endpoint
+    @app.get("/health")
+    async def health_http():
+        edge_url = _resolve_edge_url()
+        ok, host = _is_host_allowlisted(edge_url)
+        if not ok:
+            return {"ok": False, "edge": {"url": edge_url, "error": f"host '{host}' not in allowlist"}}
+        headers = make_edge_headers()
+        status, data, text = await _post_json(edge_url, {"ping": True}, headers)
+        return {
+            "ok": status == 200,
+            "edge": {"url": edge_url, "status": status, "body": data if data else _truncate(text)},
+            "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        }
+
+    # Mount MCP server at /mcp (FastMCP 2.12.x: no path kwarg on http_app)
+    app.mount("/mcp", mcp.http_app())
+    return app
 
 # Exported for platform discovery (FastCloud)
 app = build_app()
