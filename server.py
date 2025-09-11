@@ -1,316 +1,498 @@
-#!/usr/bin/env python3
-# server.py
+"""
+BDB (BurnsDB) — FastCloud MCP Server
+------------------------------------
+
+Deployment-safe server module for FastCloud:
+
+- Exports `app` at module import time (NO uvicorn.run(), NO event-loop starts).
+- Uses FastMCP SDK HTTP app directly; FastCloud will host it at port 8080.
+- FastCloud auth handles user authentication; NO MCP_API_KEY required.
+- Supabase access uses SERVICE ROLE KEY (from FastCloud secrets) for Edge Function calls & DB.
+- Edge Function endpoint is STATIC and singular (advanced_semantic_search).
+
+Environment (minimal; set via FastCloud):
+  SUPABASE_URL=https://nqkzqcsqfvpquticvwmk.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY=<set in FastCloud Secrets>
+  OPENAI_API_KEY=<set in FastCloud Secrets, if you will use OpenAI tools>
+Optional:
+  ALLOWLIST_HOSTS= n q k z q c s q f v p q u t i c v w m k.supabase.co,nqkzqcsqfvpquticvwmk.functions.supabase.co,api.openai.com,chatgpt.com,raw.githubusercontent.com,httpbin.org,playground.ai.cloudflare.com,example.com
+  MAX_FETCH_SIZE=1000000
+  SNIPPET_LENGTH=500
+  ENABLE_DIAG=1
+
+NOTE: This file purposefully avoids any FastAPI/Starlette `on_event` startup/shutdown handlers
+to prevent the "Already running asyncio in this thread" crash under FastCloud.
+"""
+
 import os
-from typing import Optional, Dict, Any, List, Tuple
+import sys
+from typing import Dict, Optional, List, Any
 
 import httpx
-from fastapi import FastAPI
-from starlette.middleware.cors import CORSMiddleware
+from fastmcp import FastMCP
 from starlette.responses import PlainTextResponse, JSONResponse
 
-# FastMCP: support both >=2.12.2 (has http_app) and 2.12.0 (no http_app)
+# ---------- Supabase (optional direct table access) ----------
 try:
-    from mcp.server.fastmcp import FastMCP
-except Exception as e:  # very early/defensive
-    raise RuntimeError(f"FastMCP import failed: {e}")
-
-# --- Optional Python client; gracefully degrade to REST if unavailable ---
-try:
-    from supabase import create_client
-except Exception:
+    from supabase import create_client, Client as SupabaseClient  # type: ignore
+except Exception as e:
+    print("Supabase SDK not installed or import failed:", e, file=sys.stderr)
     create_client = None
+    SupabaseClient = None  # type: ignore
 
-# ----------------------------
-# Environment & configuration
-# ----------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_PROJECT_REF = os.getenv("SUPABASE_PROJECT_REF", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-SUPABASE_KEY = (
-    os.getenv("SUPABASE_KEY")  # optional alias
-    or SUPABASE_SERVICE_ROLE_KEY
-    or SUPABASE_ANON_KEY
-)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://nqkzqcsqfvpquticvwmk.supabase.co").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-EDGE_FUNCTION_PATH = os.getenv("EDGE_FUNCTION_PATH", "")
-EDGE_FUNCTION_NAME = os.getenv("EDGE_FUNCTION_NAME", "advanced_semantic_search")
-EDGEFN_AUTH_MODE = os.getenv("EDGEFN_AUTH_MODE", "supabase").lower()  # "none"|"supabase"|"service_role"
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-ALLOWLIST_HOSTS = os.getenv("ALLOWLIST_HOSTS", "")
-ENABLE_DIAG = os.getenv("ENABLE_DIAG", "0") == "1"
-try:
-    PORT = int(os.getenv("PORT", "8080"))
-except ValueError:
-    PORT = 8080
+# If you want anon-key fallbacks for read-only paths, you could add them here.
+# This server intentionally uses ONLY the service role key for Supabase access.
+SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY
 
-# HTTP client tuning
-try:
-    HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "30"))
-except ValueError:
-    HTTP_TIMEOUT_S = 30.0
-try:
-    HTTP_MAX_CONNECTIONS = int(os.getenv("HTTP_MAX_CONNECTIONS", "20"))
-except ValueError:
-    HTTP_MAX_CONNECTIONS = 20
-try:
-    HTTP_MAX_KEEPALIVE = int(os.getenv("HTTP_MAX_KEEPALIVE", "10"))
-except ValueError:
-    HTTP_MAX_KEEPALIVE = 10
-USER_AGENT = os.getenv("USER_AGENT", "BurnsLegal-MCP/1.0")
-
-# ----------------------------
-# Utilities
-# ----------------------------
-def _split_csv(v: str) -> List[str]:
-    return [s.strip() for s in v.split(",") if s.strip()]
-
-def _origin_of(url: str) -> str:
-    from urllib.parse import urlparse
-    p = urlparse(url)
-    return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else url
-
-def _host_of(url: str) -> str:
-    from urllib.parse import urlparse
-    p = urlparse(url if "://" in url else f"https://{url}")
-    return p.netloc
-
-def is_allowlisted(url: str) -> bool:
-    """Accept entries as full origins (https://host) or bare domains (host.tld). '*' or empty => allow all."""
-    if not ALLOWLIST_HOSTS or ALLOWLIST_HOSTS.strip() == "":
-        return True
-    allowed = _split_csv(ALLOWLIST_HOSTS)
-    if "*" in allowed or not allowed:
-        return True
-    url_origin = _origin_of(url)
-    url_host = _host_of(url)
-    for entry in allowed:
-        entry_origin = _origin_of(entry)
-        entry_host = _host_of(entry)
-        if url_origin == entry_origin or url_host == entry_host:
-            return True
-    return False
-
-def resolve_edge_function_url(function_name: Optional[str] = None) -> str:
-    """
-    Resolve a concrete Edge Function URL.
-    Precedence: explicit EDGE_FUNCTION_PATH (full or base), then SUPABASE_URL/functions/v1/<name>, then <ref>.functions.supabase.co/<name>.
-    If EDGE_FUNCTION_PATH looks like a base (ends with '/functions/v1' or contains no function segment), append '/<function_name>'.
-    """
-    name = (function_name or EDGE_FUNCTION_NAME or "advanced_semantic_search").strip("/")
-    if EDGE_FUNCTION_PATH:
-        base = EDGE_FUNCTION_PATH.rstrip("/")
-        # heuristics: treat as base if endswith functions/v1 or host only
-        if base.endswith("/functions/v1") or base.count("/") <= 2:
-            return f"{base}/{name}"
-        return base
-    if SUPABASE_URL:
-        return f"{SUPABASE_URL.rstrip('/')}/functions/v1/{name}"
-    if SUPABASE_PROJECT_REF:
-        return f"https://{SUPABASE_PROJECT_REF}.functions.supabase.co/{name}"
-    return ""
-
-def supabase_auth_headers(key: str) -> Dict[str, str]:
-    return {"Content-Type": "application/json", "Authorization": f"Bearer {key}", "apikey": key}
-
-def make_edge_headers(mode: str = EDGEFN_AUTH_MODE) -> Dict[str, str]:
-    """
-    - 'none'         -> no Authorization/apikey
-    - 'supabase'     -> use anon (least privilege) or SUPABASE_KEY
-    - 'service_role' -> use service role key
-    """
-    mode = (mode or "").lower()
-    base: Dict[str, str] = {"Content-Type": "application/json"}
-    key: Optional[str] = None
-    if mode == "service_role":
-        key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
-    elif mode in ("supabase", "apikey"):
-        key = SUPABASE_ANON_KEY or SUPABASE_KEY
-    else:
-        key = None
-    if key:
-        base.update(supabase_auth_headers(key))
-    return base
-
-# Optional Python client
-_supabase = None
+_supabase: Optional["SupabaseClient"] = None
 if create_client and SUPABASE_URL and SUPABASE_KEY:
     try:
         _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("[BDB] Supabase client initialized.")
+    except Exception as e:
+        print("[BDB] Supabase client init failed:", e, file=sys.stderr)
+else:
+    print("[BDB] Supabase client not initialized (missing SDK or env). Some tools will be inactive.", file=sys.stderr)
+
+# ---------- Static Edge Function config ----------
+# Single, fixed Edge Function used by all semantic/hybrid search tools.
+EDGE_FUNCTION_URL = "https://nqkzqcsqfvpquticvwmk.functions.supabase.co/advanced_semantic_search"
+
+def _edge_headers() -> Dict[str, str]:
+    """
+    Always include apikey + Authorization: Bearer <service_role_key> when key is available.
+    Works with opaque service keys (non-JWT).
+    """
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    key = SUPABASE_SERVICE_ROLE_KEY
+    if key:
+        headers["apikey"] = key
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+# ---------- Allowlist and fetch limits ----------
+_allowlist_env = os.getenv("ALLOWLIST_HOSTS", "")
+_ALLOWED: Optional[set] = None if _allowlist_env in ("", "*") else {h.strip().lower() for h in _allowlist_env.split(",") if h.strip()}
+_MAX_FETCH_SIZE = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
+_SNIPPET_LENGTH = int(os.getenv("SNIPPET_LENGTH", "500"))
+_ENABLE_DIAG = os.getenv("ENABLE_DIAG", "0") == "1"
+
+# ---------- Utilities ----------
+def _host_allowed(url: str) -> bool:
+    try:
+        host = httpx.URL(url).host or ""
     except Exception:
-        _supabase = None
+        return False
+    if _ALLOWED is None:
+        return True
+    return host.lower() in _ALLOWED
 
-# ----------------------------
-# Build FastMCP server
-# ----------------------------
-mcp = FastMCP("burns-legal-streamable")
+def _snippet(txt: str, n: int = _SNIPPET_LENGTH) -> str:
+    if len(txt) <= n:
+        return txt
+    return txt[:n] + "..."
 
-# MCP root (when mounted at /mcp this becomes /mcp/)
+def _normalize_exhibit_id(eid: str) -> str:
+    s = (eid or "").strip()
+    if s.lower().startswith("exhibit_"):
+        num = s[len("exhibit_"):].lstrip("0") or "0"
+        return f"Ex{int(num):03d}"
+    if s.lower().startswith("ex") and s[2:].isdigit():
+        return f"Ex{int(s[2:]):03d}"
+    return s
+
+def _categorize_exhibit(description: str, filename: str = "") -> str:
+    t = (description or "").lower() + " " + (filename or "").lower()
+    if any(k in t for k in ("contract", "agreement")):
+        return "KEY_CONTRACT"
+    if any(k in t for k in ("email", "correspondence", "letter", "communication")):
+        return "BREACH_EVIDENCE"
+    if any(k in t for k in ("financial", "damages", "statement", "report", "audit")):
+        return "DAMAGES"
+    return "OTHER"
+
+# ---------- FastMCP Server ----------
+mcp = FastMCP("BDB")
+
+# Root and health (for probes)
 @mcp.custom_route("/", methods=["GET"])
-async def _root_ok(_req):
+async def _root_ok(_request):
     return PlainTextResponse("ok", status_code=200)
 
-# Optional diagnostic route
-if ENABLE_DIAG:
-    @mcp.custom_route("/diag/supabase", methods=["GET"])
-    async def _diag_supabase(_req):
-        if not SUPABASE_URL or not (SUPABASE_ANON_KEY or SUPABASE_KEY):
-            return JSONResponse({"ok": False, "error": "supabase_not_configured"}, status_code=200)
-        headers = supabase_auth_headers(SUPABASE_ANON_KEY or SUPABASE_KEY)
-        url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/documents"
-        params = {"select": "id", "limit": "1"}
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                r = await client.get(url, params=params, headers=headers)
-                ok = (r.status_code in (200, 206))
-                return JSONResponse({"ok": ok, "status": r.status_code})
-        except Exception as e:
-            return JSONResponse({"ok": False, "error": str(e)})
-
-async def _call_edge_function(query: str, mode: str, top_k: int, min_score: float) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Call Supabase Edge Function if configured and allowlisted.
-
-    Returns (data, error):
-    - data: dict result if successful (or structured error dict on invalid JSON)
-    - error: string code if the call could not be made or failed non-200
-    """
-    edge_url = resolve_edge_function_url()
-    if not edge_url or not is_allowlisted(edge_url):
-        return None, "edgefn_not_configured_or_not_allowlisted"
-
-    headers = {"User-Agent": USER_AGENT}
-    headers.update(make_edge_headers())
-    try:
-        client = _http_client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_S, limits=http_limits, headers={"User-Agent": USER_AGENT})
-        close_after = client is not _http_client
-        resp = await client.post(
-            edge_url,
-            json={"query": query, "mode": mode, "top_k": top_k, "min_score": min_score},
-            headers=headers,
-        )
-        if close_after:
-            await client.aclose()
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-            except Exception:
-                # treat invalid JSON as a terminal edge error response
-                return {"error": "invalid_edge_json", "text": resp.text[:500]}, None
-            return data if isinstance(data, dict) else {"results": data}, None
-        return None, f"edgefn_{resp.status_code}"
-    except Exception as e:
-        return None, f"edgefn_exc_{e}"
-
-async def _keyword_search_fallback(query: str, top_k: int, edge_err: str) -> Dict[str, Any]:
-    """Fallback to PostgREST keyword search against documents table."""
-    if not SUPABASE_URL or not (SUPABASE_ANON_KEY or SUPABASE_KEY):
-        return {"ok": False, "error": f"supabase_not_configured; edge_err={edge_err}", "items": []}
-    if not is_allowlisted(SUPABASE_URL):
-        return {"ok": False, "error": f"supabase_url_not_allowlisted; edge_err={edge_err}", "items": []}
-
-    headers = supabase_auth_headers(SUPABASE_ANON_KEY or SUPABASE_KEY)
-    params = {
-        "select": "id,title,preview",
-        "content": f"ilike.*{query}*",
-        "limit": str(top_k),
+@mcp.custom_route("/health", methods=["GET"])
+async def _health(_request):
+    info = {
+        "server": {"name": "BDB", "version": "1.0.0"},
+        "edge": {"url": EDGE_FUNCTION_URL, "configured": bool(EDGE_FUNCTION_URL), "auth": bool(SUPABASE_SERVICE_ROLE_KEY)},
+        "supabase_client": bool(_supabase is not None)
     }
+    return JSONResponse(info, status_code=200)
+
+# Optional diagnostics
+if _ENABLE_DIAG:
+    @mcp.custom_route("/diag/edge", methods=["GET"])
+    async def _diag_edge(_request):
+        if not EDGE_FUNCTION_URL:
+            return JSONResponse({"ok": False, "error": "no_edge_url"}, status_code=200)
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.post(EDGE_FUNCTION_URL, json={"ping": True}, headers=_edge_headers())
+            try:
+                body = await r.json()
+            except Exception:
+                body = {"_text": r.text[:500]}
+            return JSONResponse({"ok": r.status_code == 200, "status": r.status_code, "body": body}, status_code=200)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+    @mcp.custom_route("/diag/supabase", methods=["GET"])
+    async def _diag_supabase(_request):
+        if not _supabase:
+            return JSONResponse({"ok": False, "error": "no_client"}, status_code=200)
+        try:
+            # lightweight existence check
+            resp = _supabase.table("vector_embeddings").select("exhibit_id").limit(1).execute()
+            count = 0
+            if hasattr(resp, "data") and isinstance(resp.data, list):
+                count = len(resp.data)
+            return JSONResponse({"ok": True, "vector_embeddings_sample_rows": count}, status_code=200)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
+
+# ---------- Core Tools (search & retrieval) ----------
+
+@mcp.tool()
+async def edge_search(query: str, top_k: int = 10, mode: str = "hybrid") -> Dict[str, Any]:
+    """
+    Call the Supabase Edge Function for semantic / hybrid / BM25 search.
+    mode: "hybrid" | "vector" | "bm25"
+    """
+    if not EDGE_FUNCTION_URL:
+        return {"ok": False, "error": "edge_function_not_configured", "results": []}
+    payload = {"query": query, "matchCount": max(1, min(int(top_k), 100)), "mode": (mode or "hybrid").lower()}
     try:
-        client = _http_client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_S, limits=http_limits, headers={"User-Agent": USER_AGENT})
-        close_after = client is not _http_client
-        r = await client.get(f"{SUPABASE_URL.rstrip('/')}/rest/v1/documents", params=params, headers=headers)
-        if close_after:
-            await client.aclose()
-        if r.status_code not in (200, 206):
-            return {"ok": False, "error": f"rest_{r.status_code}; edge_err={edge_err}", "items": []}
-        items = r.json() or []
-        return {"ok": True, "items": items, "fallback": True, "edge_err": edge_err}
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(EDGE_FUNCTION_URL, json=payload, headers=_edge_headers())
     except Exception as e:
-        return {"ok": False, "error": f"rest_exc_{e}; edge_err={edge_err}", "items": []}
-
-@mcp.tool(description="Hybrid search via Supabase EdgeFn with safe fallback to keyword PostgREST.")
-async def search(query: str, mode: str = "hybrid", top_k: int = 10, min_score: float = 0.0) -> Dict[str, Any]:
-    data, err = await _call_edge_function(query=query, mode=mode, top_k=top_k, min_score=min_score)
-    if data is not None:
-        return data
-    edge_err = err or "edgefn_unknown"
-    return await _keyword_search_fallback(query=query, top_k=top_k, edge_err=edge_err)
-
-# ----------------------------
-# Host FastAPI and mount MCP at /mcp
-# ----------------------------
-main_app = FastAPI(title="Burns Legal MCP", version="1.0.0")
-allow_origins = ["*"] if ALLOWED_ORIGINS.strip() == "*" else _split_csv(ALLOWED_ORIGINS)
-main_app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins or ["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
-http_limits = httpx.Limits(max_connections=HTTP_MAX_CONNECTIONS, max_keepalive_connections=HTTP_MAX_KEEPALIVE)
-_http_client: Optional[httpx.AsyncClient] = None
-
-@main_app.on_event("startup")
-async def _startup():
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_S, limits=http_limits, headers={"User-Agent": USER_AGENT})
-
-@main_app.on_event("shutdown")
-async def _shutdown():
-    global _http_client
+        return {"ok": False, "error": f"request_error: {e}", "results": []}
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"edge_function_error_{resp.status_code}", "text": resp.text[:500], "results": []}
     try:
-        if _http_client is not None:
-            await _http_client.aclose()
-    finally:
-        _http_client = None
+        data = await resp.json()
+    except Exception:
+        return {"ok": False, "error": "invalid_json_from_edge", "text": resp.text[:500], "results": []}
+    if not isinstance(data, list):
+        return {"ok": False, "error": "invalid_response_format", "results": []}
+    return {"ok": True, "results": data}
 
-@main_app.get("/")
-async def root():
-    return {"ok": True}
-
-@main_app.get("/health")
-async def health():
-    return {"status": "healthy", "app": "burns-legal-streamable"}
-
-# --- FastMCP 2.12.x compatibility shim ---
-def _compat_http_app(server: FastMCP, path: str = "/mcp"):
+@mcp.tool()
+async def search_legal(query: str, top_k: int = 10) -> Dict[str, Any]:
     """
-    Compatibility shim for FastMCP 2.12.0 environments that lack `server.http_app`.
-
-    When FastCloud (or other deploy targets) import an MCP server module, they may
-    expect a callable ASGI app mounted at a path. FastMCP gained `http_app()` in
-    >= 2.12.2; older 2.12.0 builds do not have this attribute. In those cases:
-
-    - We expose a minimal FastAPI app so HTTP probing and import inspection succeed.
-    - The actual transport wiring is performed by the FastMCP CLI when the platform
-      executes `fastmcp run` with HTTP transport.
-    - This avoids double event loop issues (e.g., "Already running asyncio in this thread")
-      that can occur if the module tries to start its own runner during import time.
-
-    If `server.http_app` exists, we simply delegate to it.
+    High-level semantic/hybrid search with concise snippets.
     """
-    if hasattr(server, "http_app"):
-        return server.http_app(path=path)  # type: ignore[attr-defined]
-    # Minimal shim: mount a root "ok" while FastCloud uses the CLI to wire HTTP transport.
-    # This prevents 'inspect' from failing and keeps /mcp/ok probe working pre-run.
-    from fastapi import FastAPI
-    shim = FastAPI()
-    @shim.get("/")
-    async def ok():
-        return {"ok": True, "shim": "fastmcp-2.12.0"}
-    return shim
+    res = await edge_search(query=query, top_k=top_k, mode="hybrid")
+    if not res.get("ok"):
+        return res
+    items: List[Dict[str, Any]] = []
+    for r in res.get("results", []):
+        ex = r.get("exhibit_id") or r.get("id") or "Unknown"
+        text = r.get("text") or r.get("chunk") or r.get("content") or ""
+        score = r.get("score") or r.get("similarity")
+        items.append({"exhibit_id": ex, "snippet": _snippet(str(text)), "score": score})
+    return {"ok": True, "items": items}
 
-try:
-    mcp_app = mcp.http_app(path="/mcp")  # >=2.12.2
-except Exception:
-    mcp_app = _compat_http_app(mcp, path="/mcp")  # 2.12.0 shim
+@mcp.tool()
+async def bm25_search(query: str, top_k: int = 10) -> Dict[str, Any]:
+    """BM25-only search via Edge Function."""
+    return await edge_search(query=query, top_k=top_k, mode="bm25")
 
-main_app.mount("/mcp", mcp_app)
-app = main_app  # ASGI export for local uvicorn if used
+@mcp.tool()
+async def vector_search(query: str, top_k: int = 10) -> Dict[str, Any]:
+    """Vector-only similarity search via Edge Function."""
+    return await edge_search(query=query, top_k=top_k, mode="vector")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+@mcp.tool()
+async def rerank(results: List[Dict[str, Any]], method: str = "relevance") -> Dict[str, Any]:
+    """
+    Simple reranking of already-fetched results.
+    method: "relevance" | "recency" | "rrf"
+    """
+    if not isinstance(results, list):
+        return {"ok": False, "error": "invalid_results_format", "results": []}
+    m = (method or "relevance").lower()
+    out = results
+    if m == "relevance":
+        try:
+            out = sorted(results, key=lambda x: x.get("score", 0.0) or 0.0, reverse=True)
+        except Exception:
+            out = results
+    elif m == "recency":
+        # if exhibit dates exist, you could wire a DB lookup here. Leave stable.
+        out = results
+    elif m in ("rrf", "reciprocal rank fusion"):
+        out = results
+    else:
+        return {"ok": False, "error": f"unknown_method:{method}", "results": results}
+    return {"ok": True, "results": out}
+
+@mcp.tool()
+async def label_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Assign lightweight labels to results (e.g., CONTRACT / EVIDENCE / DAMAGES).
+    """
+    labeled = []
+    # Enrich from exhibits table if possible
+    for r in results:
+        ex = r.get("exhibit_id") or r.get("id") or ""
+        desc, fname = "", ""
+        if _supabase and ex:
+            try:
+                q = _supabase.table("exhibits").select("description, filename").eq("Exhibit_ID", _normalize_exhibit_id(ex))
+                resp = q.limit(1).execute()
+                if resp.data:
+                    desc = (resp.data[0] or {}).get("description") or ""
+                    fname = (resp.data[0] or {}).get("filename") or ""
+            except Exception:
+                pass
+        label = _categorize_exhibit(desc or r.get("snippet", ""), fname)
+        lr = dict(r)
+        lr["category"] = label
+        labeled.append(lr)
+    return {"ok": True, "results": labeled}
+
+# ---------- Retrieval Tools ----------
+
+@mcp.tool()
+def fetch_exhibit(exhibit_id: str) -> Dict[str, Any]:
+    """Retrieve the full text pages for a given exhibit."""
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized", "pages": []}
+    eid = _normalize_exhibit_id(exhibit_id)
+    try:
+        chunks = (_supabase
+                  .table("vector_embeddings")
+                  .select("text,page_start,page_end,chunk_index")
+                  .eq("exhibit_id", eid)
+                  .order("chunk_index", asc=True)
+                  .execute()).data or []
+    except Exception as e:
+        return {"ok": False, "error": f"chunk_fetch_error:{e}", "pages": []}
+
+    pages: List[str] = []
+    cur_page = None
+    buf = ""
+    for ch in chunks:
+        t = ch.get("text", "") or ""
+        ps = ch.get("page_start")
+        if ps is None:
+            pages.append(t)
+            continue
+        if cur_page is None:
+            cur_page, buf = ps, t
+        elif ps == cur_page:
+            buf += " " + t
+        else:
+            pages.append(buf)
+            cur_page, buf = ps, t
+    if buf:
+        pages.append(buf)
+    meta = {"exhibit_id": eid}
+    try:
+        meta_resp = _supabase.table("exhibits").select("description,filename").eq("Exhibit_ID", eid).limit(1).execute()
+        if meta_resp.data:
+            meta.update({k: meta_resp.data[0].get(k) for k in ("description", "filename")})
+    except Exception:
+        pass
+    return {"ok": True, **meta, "pages": pages}
+
+@mcp.tool()
+def list_exhibits(withLabels: bool = False) -> Dict[str, Any]:
+    """List all exhibits with optional category labeling."""
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized", "exhibits": []}
+    try:
+        data = (_supabase.table("exhibits")
+                .select("Exhibit_ID,description,filename")
+                .execute()).data or []
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_error:{e}", "exhibits": []}
+    out = []
+    for rec in data:
+        ex = rec.get("Exhibit_ID")
+        item = {"exhibit_id": ex, "description": rec.get("description", "")}
+        if withLabels:
+            item["category"] = _categorize_exhibit(rec.get("description", ""), rec.get("filename", ""))
+        out.append(item)
+    return {"ok": True, "exhibits": out}
+
+# ---------- Keyword (BM25) direct via PostgREST (optional) ----------
+@mcp.tool()
+def keyword_search(query: str, top_k: int = 10) -> Dict[str, Any]:
+    """
+    Keyword/BM25-style search using PostgREST full text on text column.
+    Requires a text search index on vector_embeddings.text in your DB.
+    """
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized", "items": []}
+    try:
+        # Using PostgREST text_search helper
+        resp = (_supabase.table("vector_embeddings")
+                .select("exhibit_id,text,similarity")
+                .text_search("text", query, {"config": "english", "type": "websearch"})
+                .limit(max(1, min(int(top_k), 100)))
+                .execute())
+        rows = resp.data or []
+    except Exception as e:
+        return {"ok": False, "error": f"search_error:{e}", "items": []}
+    items = [{"exhibit_id": r.get("exhibit_id", "Unknown"), "snippet": _snippet(r.get("text", ""))} for r in rows]
+    return {"ok": True, "items": items}
+
+# ---------- Fetch utilities ----------
+
+@mcp.tool()
+def fetch(url: str) -> Dict[str, Any]:
+    """Fetch arbitrary URL content (allowlist + size cap)."""
+    if not _host_allowed(url):
+        return {"ok": False, "error": "host_not_allowed"}
+    try:
+        r = httpx.get(url, follow_redirects=True, timeout=10.0)
+    except Exception as e:
+        return {"ok": False, "error": f"request_error:{e}"}
+    if r.status_code != 200:
+        return {"ok": False, "error": f"http_{r.status_code}"}
+    b = r.content[:_MAX_FETCH_SIZE]
+    text = b.decode("utf-8", errors="ignore")
+    return {"ok": True, "content_snippet": _snippet(text), "content_length": len(text)}
+
+@mcp.tool()
+def fetch_allowed(url: str) -> Dict[str, Any]:
+    """Alias of fetch() with allowlist enforced."""
+    return fetch(url)
+
+# ---------- Case data helpers ----------
+
+@mcp.tool()
+def list_claims(status: Optional[str] = None) -> Dict[str, Any]:
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized", "claims": []}
+    try:
+        q = _supabase.table("claims").select("*")
+        if status:
+            q = q.ilike("status", status)
+        rows = q.execute().data or []
+        return {"ok": True, "claims": rows}
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_error:{e}", "claims": []}
+
+@mcp.tool()
+def get_facts_by_claim(claim_id: str) -> Dict[str, Any]:
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized", "facts": []}
+    try:
+        rows = (_supabase.table("facts").select("*").eq("claim_id", claim_id).execute()).data or []
+        return {"ok": True, "facts": rows}
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_error:{e}", "facts": []}
+
+@mcp.tool()
+def get_facts_by_exhibit(exhibit_id: str) -> Dict[str, Any]:
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized", "facts": []}
+    eid = _normalize_exhibit_id(exhibit_id)
+    try:
+        rows = (_supabase.table("facts").select("*").eq("exhibit_id", eid).execute()).data or []
+        return {"ok": True, "facts": rows}
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_error:{e}", "facts": []}
+
+@mcp.tool()
+def get_case_statistics() -> Dict[str, Any]:
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized"}
+    stats: Dict[str, Any] = {}
+    try:
+        c = _supabase.table("claims").select("id", count="exact").execute()
+        stats["num_claims"] = c.count if hasattr(c, "count") and c.count is not None else len(c.data or [])
+    except Exception as e:
+        stats["num_claims"] = f"error:{e}"
+    try:
+        e = _supabase.table("exhibits").select("id", count="exact").execute()
+        stats["num_exhibits"] = e.count if hasattr(e, "count") and e.count is not None else len(e.data or [])
+    except Exception as e2:
+        stats["num_exhibits"] = f"error:{e2}"
+    try:
+        f = _supabase.table("facts").select("id", count="exact").execute()
+        stats["num_facts"] = f.count if hasattr(f, "count") and f.count is not None else len(f.data or [])
+    except Exception as e3:
+        stats["num_facts"] = f"error:{e3}"
+    return {"ok": True, "statistics": stats}
+
+@mcp.tool()
+def get_case_timeline() -> Dict[str, Any]:
+    # Static example; wire to DB if timeline table exists.
+    timeline = [
+        {"date": "2020-11-06", "event": "Operating Agreement for Floorable LLC signed"},
+        {"date": "2021-09-15", "event": "Employee termination that led to breach allegation"},
+        {"date": "2022-01-05", "event": "Legal complaint filed by R. Burns"},
+        {"date": "2023-03-10", "event": "Discovery phase begins, key evidence collected"},
+        {"date": "2024-07-22", "event": "Trial scheduled in California Superior Court"},
+    ]
+    return {"ok": True, "timeline": timeline}
+
+@mcp.tool()
+def get_entities() -> Dict[str, Any]:
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized", "entities": []}
+    try:
+        rows = (_supabase.table("entities").select("*").execute()).data or []
+        return {"ok": True, "entities": rows}
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_error:{e}", "entities": []}
+
+@mcp.tool()
+def get_individuals(role: Optional[str] = None) -> Dict[str, Any]:
+    if not _supabase:
+        return {"ok": False, "error": "supabase_client_not_initialized", "individuals": []}
+    try:
+        q = _supabase.table("individuals").select("*")
+        if role:
+            q = q.ilike("role", role)
+        rows = q.execute().data or []
+        return {"ok": True, "individuals": rows}
+    except Exception as e:
+        return {"ok": False, "error": f"fetch_error:{e}", "individuals": []}
+
+# ---------- Utility/Info Tools ----------
+
+@mcp.tool()
+def list_capabilities() -> Dict[str, Any]:
+    """Enumerate tool names & brief descriptions."""
+    tools = [
+        {"name": "edge_search", "desc": "Edge Function search (hybrid/vector/bm25)"},
+        {"name": "search_legal", "desc": "Hybrid search with snippets"},
+        {"name": "bm25_search", "desc": "BM25-only search via Edge Function"},
+        {"name": "vector_search", "desc": "Vector-only search via Edge Function"},
+        {"name": "rerank", "desc": "Rerank an existing result list"},
+        {"name": "label_results", "desc": "Assign simple labels to results"},
+        {"name": "fetch_exhibit", "desc": "Retrieve full pages for an exhibit"},
+        {"name": "list_exhibits", "desc": "List exhibits (optionally labeled)"},
+        {"name": "keyword_search", "desc": "Direct BM25-ish keyword search via PostgREST"},
+        {"name": "list_claims", "desc": "List all claims (optional status filter)"},
+        {"name": "get_facts_by_claim", "desc": "Facts for a given claim"},
+        {"name": "get_facts_by_exhibit", "desc": "Facts for a given exhibit"},
+        {"name": "get_case_statistics", "desc": "Counts of key tables"},
+        {"name": "get_case_timeline", "desc": "Static example timeline"},
+        {"name": "get_entities", "desc": "Entities list"},
+        {"name": "get_individuals", "desc": "Individuals list"},
+        {"name": "fetch", "desc": "HTTP GET with allowlist & size caps"},
+        {"name": "fetch_allowed", "desc": "Alias of fetch"},
+        {"name": "list_capabilities", "desc": "This list"},
+    ]
+    return {"ok": True, "tools": tools}
+
+# ---------- Export HTTP app for FastCloud ----------
+# IMPORTANT: Do NOT start uvicorn here; FastCloud will import `app` and run it.
+app = mcp.http_app()
