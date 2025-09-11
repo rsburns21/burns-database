@@ -1,0 +1,74 @@
+{
+  "app": {
+    "name": "BDB",
+    "env": "production",
+    "log_level": "info"
+  },
+  "http": {
+    "port": 8080,
+    "mount_path": "/mcp",
+    "cors_allowed_origins": "*"
+  },
+  "allowlist_hosts": [
+    "nqkzqcsqfvpquticvwmk.supabase.co",
+    "nqkzqcsqfvpquticvwmk.functions.supabase.co",
+    "api.openai.com",
+    "chatgpt.com",
+    "raw.githubusercontent.com",
+    "httpbin.org",
+    "playground.ai.cloudflare.com",
+    "example.com"
+  ],
+  "supabase": {
+    "project_ref": "nqkzqcsqfvpquticvwmk",
+    "url": "https://nqkzqcsqfvpquticvwmk.supabase.co",
+    "edge": {
+      "url": "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search",
+      "name": "advanced_semantic_search",
+      "auth_mode": "service_role"
+    },
+    "db": {
+      "vector_table": "vector_embeddings",
+      "embedding_dim": 384,
+      "rpcs": {
+        "hybrid_search": "match_documents",
+        "vector_search": "search_by_vector",
+        "chunk_match": "match_chunks"
+      }
+    }
+  },
+  "search_defaults": {
+    "mode": "hybrid",
+    "top_k": 10,
+    "bm25_top_k": 25,
+    "vector_top_k": 25,
+    "rerank_top_k": 20,
+    "min_score": 0.0,
+    "snippet_length": 500,
+    "embed_dim": 384
+  },
+  "openai": {
+    "completions_model": "gpt-4.1",
+    "rerank_model": "text-embedding-3-small"
+  },
+  "diagnostics": {
+    "enable_diag": true
+  },
+  "auth": {
+    "mcp_api_key_required": false
+  },
+  "tools": {
+    "echo": true,
+    "list_capabilities": true,
+    "list_tools": true,
+    "fetch": true,
+    "fetch_allowed": true,
+    "edge_search": true,
+    "search_legal": true,
+    "bm25_search": true,
+    "vector_search": true,
+    "hybrid_search": true,
+    "rerank": true,
+    "label": true
+  }
+}

@@ -1,0 +1,50 @@
+name: burns-database
+version: 1.0.0
+description: Burns Database MCP server (FastMCP HTTP) targeting Supabase Edge function
+
+cloud:
+  provider: fastmcp
+  region: us-east-1
+  subdomain: BurnsDB
+
+server:
+  main: server.py
+  port: 8080
+  entrypoint: http  # ASGI app export used by platform
+
+env:
+  - SUPABASE_URL
+  - SUPABASE_ANON_KEY
+  - SUPABASE_SERVICE_ROLE_KEY
+  - SUPABASE_KEY
+  - OPENAI_API_KEY
+  - EDGEFN_URL
+  - EDGEFN_AUTH_MODE
+  - ALLOWLIST_HOSTS
+  - SEARCH_MODE
+  - SEARCH_TOP_K
+  - SEARCH_MIN_SCORE
+  - LEXICAL_K
+  - MAX_FETCH_SIZE
+  - SNIPPET_LENGTH
+  - PORT
+  - ENABLE_DIAG
+
+features:
+  openapi: true
+  streaming: true
+  cors: true
+  progress: true
+
+security:
+  auth_mode: none  # set to bearer in production
+  cors:
+    enabled: true
+    allowed_origins:
+      - "*"
+    allowed_headers:
+      - "Content-Type"
+      - "Authorization"
+      - "Accept"
+      - "Origin"
+    allowed_methods: ["GET", "POST", "OPTIONS"]
