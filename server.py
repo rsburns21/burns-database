@@ -1,665 +1,316 @@
+#!/usr/bin/env python3
 # server.py
-# BDB — BurnsDB FastMCP server (single-file edition)
-# Version: 4.3.0
-#
-# Key goals met:
-# - No double event-loop starts (FastCloud runs the ASGI app; we do not self-run)
-# - FastMCP 2.12.x API: http_app() with no path; explicit mount is done by FastMCP CLI
-# - 30+ tools exposed (search variants, rerank, labeling, diagnostics, allowlist fetchers)
-# - Hard-wired Supabase Edge Function URL with safe env override
-# - Correct async httpx usage (await resp.json())
-# - Always send apikey + Authorization Bearer <key> when key available (service/anon)
-# - Strict outbound allowlist
-# - Query embeddings handled by edge (embed_query action)
-# - Vector dim assumed 384 (normalized in edge)
-#
-from __future__ import annotations
-
 import os
-import json
-import time
-import math
-import asyncio
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
-from fastmcp import FastMCP
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import PlainTextResponse, JSONResponse
 
-# ---------------------------
-# Server Identity & Defaults
-# ---------------------------
+# FastMCP: support both >=2.12.2 (has http_app) and 2.12.0 (no http_app)
+try:
+    from mcp.server.fastmcp import FastMCP
+except Exception as e:  # very early/defensive
+    raise RuntimeError(f"FastMCP import failed: {e}")
 
-SERVER_NAME = "BDB"
-SERVER_VERSION = "4.3.0"
+# --- Optional Python client; gracefully degrade to REST if unavailable ---
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
 
-# Hard-wired Edge Function (override with EDGEFN_URL if needed)
-EDGEFN_URL_DEFAULT = "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search"
-EDGEFN_URL = os.getenv("EDGEFN_URL", EDGEFN_URL_DEFAULT).strip()
+# ----------------------------
+# Environment & configuration
+# ----------------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_PROJECT_REF = os.getenv("SUPABASE_PROJECT_REF", "")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_KEY")  # optional alias
+    or SUPABASE_SERVICE_ROLE_KEY
+    or SUPABASE_ANON_KEY
+)
 
-# Keys (service role only for server-to-server)
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or ""
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # optional catch-all
+EDGE_FUNCTION_PATH = os.getenv("EDGE_FUNCTION_PATH", "")
+EDGE_FUNCTION_NAME = os.getenv("EDGE_FUNCTION_NAME", "advanced_semantic_search")
+EDGEFN_AUTH_MODE = os.getenv("EDGEFN_AUTH_MODE", "supabase").lower()  # "none"|"supabase"|"service_role"
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+ALLOWLIST_HOSTS = os.getenv("ALLOWLIST_HOSTS", "")
+ENABLE_DIAG = os.getenv("ENABLE_DIAG", "0") == "1"
+try:
+    PORT = int(os.getenv("PORT", "8080"))
+except ValueError:
+    PORT = 8080
 
-# OpenAI (used for rerank)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# HTTP client tuning
+try:
+    HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "30"))
+except ValueError:
+    HTTP_TIMEOUT_S = 30.0
+try:
+    HTTP_MAX_CONNECTIONS = int(os.getenv("HTTP_MAX_CONNECTIONS", "20"))
+except ValueError:
+    HTTP_MAX_CONNECTIONS = 20
+try:
+    HTTP_MAX_KEEPALIVE = int(os.getenv("HTTP_MAX_KEEPALIVE", "10"))
+except ValueError:
+    HTTP_MAX_KEEPALIVE = 10
+USER_AGENT = os.getenv("USER_AGENT", "BurnsLegal-MCP/1.0")
 
-# Strict allowlist for outbound calls (scheme ignored; host matched)
-ALLOWLIST_DEFAULT = [
-    "nqkzqcsqfvpquticvwmk.supabase.co",
-    "nqkzqcsqfvpquticvwmk.functions.supabase.co",
-    "api.openai.com",
-    "chatgpt.com",
-    "raw.githubusercontent.com",
-    "httpbin.org",
-    "playground.ai.cloudflare.com",
-    "example.com",
-]
-ALLOWLIST_HOSTS = [
-    h.strip().lower()
-    for h in (os.getenv("ALLOWLIST_HOSTS", ",".join(ALLOWLIST_DEFAULT))).split(",")
-    if h.strip()
-]
+# ----------------------------
+# Utilities
+# ----------------------------
+def _split_csv(v: str) -> List[str]:
+    return [s.strip() for s in v.split(",") if s.strip()]
 
-MAX_FETCH_SIZE = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
-SNIPPET_LENGTH = int(os.getenv("SNIPPET_LENGTH", "500"))
-HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "20"))
+def _origin_of(url: str) -> str:
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}" if p.scheme and p.netloc else url
 
-# Search defaults
-SEARCH_MODE = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()  # vector|bm25|hybrid|semantic
-SEARCH_TOP_K = int(os.getenv("SEARCH_TOP_K", "10"))
-SEARCH_MIN_SCORE = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
-LEXICAL_K = int(os.getenv("LEXICAL_K", "0"))  # reserved
+def _host_of(url: str) -> str:
+    from urllib.parse import urlparse
+    p = urlparse(url if "://" in url else f"https://{url}")
+    return p.netloc
 
-# Embedding dimension (vector_embeddings: 384)
-EMBED_DIM = int(os.getenv("EMBED_DIM", "384"))
+def is_allowlisted(url: str) -> bool:
+    """Accept entries as full origins (https://host) or bare domains (host.tld). '*' or empty => allow all."""
+    if not ALLOWLIST_HOSTS or ALLOWLIST_HOSTS.strip() == "":
+        return True
+    allowed = _split_csv(ALLOWLIST_HOSTS)
+    if "*" in allowed or not allowed:
+        return True
+    url_origin = _origin_of(url)
+    url_host = _host_of(url)
+    for entry in allowed:
+        entry_origin = _origin_of(entry)
+        entry_host = _host_of(entry)
+        if url_origin == entry_origin or url_host == entry_host:
+            return True
+    return False
 
-# ---------------------------
-# Helpers
-# ---------------------------
-
-def _resolve_edge_url() -> str:
-    return EDGEFN_URL
-
-def make_edge_headers() -> Dict[str, str]:
+def resolve_edge_function_url(function_name: Optional[str] = None) -> str:
     """
-    Always include apikey and Authorization when a key is available.
-    Supports opaque service-role strings (non-JWT) and JWTs alike.
+    Resolve a concrete Edge Function URL.
+    Precedence: explicit EDGE_FUNCTION_PATH (full or base), then SUPABASE_URL/functions/v1/<name>, then <ref>.functions.supabase.co/<name>.
+    If EDGE_FUNCTION_PATH looks like a base (ends with '/functions/v1' or contains no function segment), append '/<function_name>'.
     """
-    headers: Dict[str, str] = {"Content-Type": "application/json"}
-    # Prefer explicit service role, then SUPABASE_KEY catch-all
-    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+    name = (function_name or EDGE_FUNCTION_NAME or "advanced_semantic_search").strip("/")
+    if EDGE_FUNCTION_PATH:
+        base = EDGE_FUNCTION_PATH.rstrip("/")
+        # heuristics: treat as base if endswith functions/v1 or host only
+        if base.endswith("/functions/v1") or base.count("/") <= 2:
+            return f"{base}/{name}"
+        return base
+    if SUPABASE_URL:
+        return f"{SUPABASE_URL.rstrip('/')}/functions/v1/{name}"
+    if SUPABASE_PROJECT_REF:
+        return f"https://{SUPABASE_PROJECT_REF}.functions.supabase.co/{name}"
+    return ""
+
+def supabase_auth_headers(key: str) -> Dict[str, str]:
+    return {"Content-Type": "application/json", "Authorization": f"Bearer {key}", "apikey": key}
+
+def make_edge_headers(mode: str = EDGEFN_AUTH_MODE) -> Dict[str, str]:
+    """
+    - 'none'         -> no Authorization/apikey
+    - 'supabase'     -> use anon (least privilege) or SUPABASE_KEY
+    - 'service_role' -> use service role key
+    """
+    mode = (mode or "").lower()
+    base: Dict[str, str] = {"Content-Type": "application/json"}
+    key: Optional[str] = None
+    if mode == "service_role":
+        key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+    elif mode in ("supabase", "apikey"):
+        key = SUPABASE_ANON_KEY or SUPABASE_KEY
+    else:
+        key = None
     if key:
-        headers.update({"apikey": key, "Authorization": f"Bearer {key}"})
-    return headers
+        base.update(supabase_auth_headers(key))
+    return base
 
-def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
+# Optional Python client
+_supabase = None
+if create_client and SUPABASE_URL and SUPABASE_KEY:
     try:
-        u = urlparse(url)
-        host = (u.hostname or "").lower()
-        return (host in ALLOWLIST_HOSTS, host)
+        _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception:
-        return (False, "")
+        _supabase = None
 
-async def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any], str]:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        resp = await client.post(url, json=body, headers=headers)
-        text = resp.text
+# ----------------------------
+# Build FastMCP server
+# ----------------------------
+mcp = FastMCP("burns-legal-streamable")
+
+# MCP root (when mounted at /mcp this becomes /mcp/)
+@mcp.custom_route("/", methods=["GET"])
+async def _root_ok(_req):
+    return PlainTextResponse("ok", status_code=200)
+
+# Optional diagnostic route
+if ENABLE_DIAG:
+    @mcp.custom_route("/diag/supabase", methods=["GET"])
+    async def _diag_supabase(_req):
+        if not SUPABASE_URL or not (SUPABASE_ANON_KEY or SUPABASE_KEY):
+            return JSONResponse({"ok": False, "error": "supabase_not_configured"}, status_code=200)
+        headers = supabase_auth_headers(SUPABASE_ANON_KEY or SUPABASE_KEY)
+        url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/documents"
+        params = {"select": "id", "limit": "1"}
         try:
-            data = await resp.json()
-        except Exception:
-            data = {}
-        return (resp.status_code, data, text)
-
-def _truncate(s: str, n: int = SNIPPET_LENGTH) -> str:
-    if not s:
-        return s
-    return s if len(s) <= n else s[: n - 3] + "..."
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-# Shared in-memory defaults (tunable via tools)
-class Defaults(BaseModel):
-    mode: str = SEARCH_MODE
-    top_k: int = SEARCH_TOP_K
-    min_score: float = SEARCH_MIN_SCORE
-    lexical_k: int = LEXICAL_K
-    max_fetch_size: int = MAX_FETCH_SIZE
-    snippet_length: int = SNIPPET_LENGTH
-
-DEFAULTS = Defaults()
-
-# ---------------------------
-# MCP Server
-# ---------------------------
-
-mcp = FastMCP(SERVER_NAME, version=SERVER_VERSION, description="BurnsDB MCP with advanced search & diagnostics")
-
-# ---------------------------
-# Schemas
-# ---------------------------
-
-class SearchParams(BaseModel):
-    q: str = Field(..., description="User query")
-    mode: str = Field(SEARCH_MODE, description="vector|bm25|hybrid|semantic")
-    top_k: int = Field(SEARCH_TOP_K, ge=1, le=200)
-    min_score: float = Field(SEARCH_MIN_SCORE, ge=0.0, description="Score threshold (edge-defined)")
-    rerank: bool = Field(False, description="Apply OpenAI-based reranking (requires OPENAI_API_KEY)")
-    label: Optional[str] = Field(None, description="Optional label to attach to this search intent")
-    metadata_filter: Optional[Dict[str, Any]] = Field(
-        None, description="Optional filter dict passed to edge function"
-    )
-
-class LabelParams(BaseModel):
-    doc_id: str
-    label: str
-
-class FetchParams(BaseModel):
-    url: str
-
-class AllowlistTestParams(BaseModel):
-    url: str
-
-class SetDefaultsParams(BaseModel):
-    mode: Optional[str] = None
-    top_k: Optional[int] = Field(None, ge=1, le=200)
-    min_score: Optional[float] = Field(None, ge=0.0)
-    lexical_k: Optional[int] = None
-    max_fetch_size: Optional[int] = None
-    snippet_length: Optional[int] = None
-
-class EdgeActionParams(BaseModel):
-    action: str = Field(..., description="Edge function action (e.g., 'embed_query')")
-    payload: Dict[str, Any] = Field(default_factory=dict)
-
-# ---------------------------
-# Utility Tools (1-7)
-# ---------------------------
-
-@mcp.tool(description="Echo text back.")
-async def echo(text: str) -> Dict[str, Any]:
-    return {"echo": text, "ts": _now_ms()}
-
-@mcp.tool(description="List server capabilities and config.")
-async def list_capabilities() -> Dict[str, Any]:
-    return {
-        "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        "edge": {"url": _resolve_edge_url()},
-        "defaults": DEFAULTS.model_dump(),
-        "allowlist_hosts": ALLOWLIST_HOSTS,
-        "embed_dim": EMBED_DIM,
-        "openai_enabled": bool(OPENAI_API_KEY),
-    }
-
-@mcp.tool(description="Return version info.")
-async def version_info() -> Dict[str, Any]:
-    return {"name": SERVER_NAME, "version": SERVER_VERSION}
-
-@mcp.tool(description="Test if a URL host is allowlisted.")
-async def allowlist_test(params: AllowlistTestParams) -> Dict[str, Any]:
-    ok, host = _is_host_allowlisted(params.url)
-    return {"ok": ok, "host": host, "allowlist": ALLOWLIST_HOSTS}
-
-@mcp.tool(description="HTTP GET (allowlisted only). Returns truncated text body.")
-async def http_get_allowed(params: FetchParams) -> Dict[str, Any]:
-    ok, host = _is_host_allowlisted(params.url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        r = await client.get(params.url)
-        body = r.text or ""
-        return {"ok": r.status_code == 200, "status": r.status_code, "host": host, "text": _truncate(body)}
-
-@mcp.tool(description="HTTP HEAD (allowlisted only).")
-async def http_head_allowed(params: FetchParams) -> Dict[str, Any]:
-    ok, host = _is_host_allowlisted(params.url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        r = await client.head(params.url)
-        return {"ok": r.status_code == 200, "status": r.status_code, "headers": dict(r.headers)}
-
-@mcp.tool(description="HTTP POST JSON (allowlisted only). Returns JSON or text snippet.")
-async def http_post_allowed(url: str, body_json: Dict[str, Any]) -> Dict[str, Any]:
-    ok, host = _is_host_allowlisted(url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        r = await client.post(url, json=body_json)
-        try:
-            data = await r.json()
-            return {"ok": r.status_code == 200, "status": r.status_code, "json": data}
-        except Exception:
-            return {"ok": r.status_code == 200, "status": r.status_code, "text": _truncate(r.text)}
-
-# ---------------------------
-# Diagnostics (8-13)
-# ---------------------------
-
-@mcp.tool(description="Check server + edge + OpenAI health quickly.")
-async def health() -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "server": {"name": SERVER_NAME, "version": SERVER_VERSION, "ts": _now_ms()},
-        "edge": {},
-        "openai": {},
-    }
-
-    # Edge ping
-    edge_url = _resolve_edge_url()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        out["edge"] = {"ok": False, "error": f"host '{host}' not in allowlist", "url": edge_url}
-    else:
-        headers = make_edge_headers()
-        status, data, text = await _post_json(edge_url, {"ping": True}, headers)
-        out["edge"] = {
-            "ok": status == 200,
-            "status": status,
-            "url": edge_url,
-            "body": data if data else _truncate(text),
-        }
-
-    # OpenAI sanity if key available
-    if OPENAI_API_KEY:
-        try:
-            # Lightweight HEAD to api.openai.com
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-                r = await client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
-                out["openai"] = {"ok": r.status_code in (200, 401, 403), "status": r.status_code}
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.get(url, params=params, headers=headers)
+                ok = (r.status_code in (200, 206))
+                return JSONResponse({"ok": ok, "status": r.status_code})
         except Exception as e:
-            out["openai"] = {"ok": False, "error": str(e)}
-    else:
-        out["openai"] = {"ok": False, "error": "OPENAI_API_KEY not set"}
+            return JSONResponse({"ok": False, "error": str(e)})
 
-    return out
+async def _call_edge_function(query: str, mode: str, top_k: int, min_score: float) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Call Supabase Edge Function if configured and allowlisted.
 
-@mcp.tool(description="Detailed edge diagnostic POST with optional payload.")
-async def diag_edge(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist", "url": edge_url}
-    status, data, text = await _post_json(edge_url, payload or {"ping": True}, headers)
-    return {"ok": status == 200, "status": status, "url": edge_url, "json": data if data else {}, "text": _truncate(text)}
+    Returns (data, error):
+    - data: dict result if successful (or structured error dict on invalid JSON)
+    - error: string code if the call could not be made or failed non-200
+    """
+    edge_url = resolve_edge_function_url()
+    if not edge_url or not is_allowlisted(edge_url):
+        return None, "edgefn_not_configured_or_not_allowlisted"
 
-@mcp.tool(description="Show config and defaults (raw).")
-async def diag_config() -> Dict[str, Any]:
-    return {
-        "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        "edge": {"url": _resolve_edge_url()},
-        "env_presence": {
-            "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_SERVICE_ROLE_KEY),
-            "OPENAI_API_KEY": bool(OPENAI_API_KEY),
-        },
-        "allowlist_hosts": ALLOWLIST_HOSTS,
-        "defaults": DEFAULTS.model_dump(),
-        "http_timeout_s": HTTP_TIMEOUT_S,
-    }
-
-@mcp.tool(description="Quick allowlist/host report.")
-async def diag_allowlist() -> Dict[str, Any]:
-    return {"allowlist_hosts": ALLOWLIST_HOSTS}
-
-@mcp.tool(description="OpenAI connectivity smoke check.")
-async def diag_openai() -> Dict[str, Any]:
-    if not OPENAI_API_KEY:
-        return {"ok": False, "error": "OPENAI_API_KEY not set"}
+    headers = {"User-Agent": USER_AGENT}
+    headers.update(make_edge_headers())
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-            r = await client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
-            return {"ok": r.status_code in (200, 401, 403), "status": r.status_code}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ---------------------------
-# Search & Retrieval (14-26)
-# ---------------------------
-
-async def _edge_search_core(params: SearchParams) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist", "url": edge_url}
-
-    body = {
-        "query": params.q,
-        "mode": (params.mode or DEFAULTS.mode).lower(),
-        "top_k": params.top_k or DEFAULTS.top_k,
-        "min_score": params.min_score if params.min_score is not None else DEFAULTS.min_score,
-        "lexical_k": DEFAULTS.lexical_k,
-    }
-    if params.label:
-        body["label"] = params.label
-    if params.metadata_filter:
-        body["filter"] = params.metadata_filter
-
-    headers = make_edge_headers()
-    status, data, text = await _post_json(edge_url, body, headers)
-    out: Dict[str, Any] = {
-        "ok": status == 200,
-        "status": status,
-        "mode": body["mode"],
-        "url": edge_url,
-    }
-    if not out["ok"]:
-        out["error"] = data if data else _truncate(text)
-        return out
-
-    results = data.get("results") or data.get("matches") or []
-    out["raw"] = data
-
-    # Optional rerank using OpenAI (if enabled & key present)
-    if params.rerank and OPENAI_API_KEY and results:
-        try:
-            out["reranked"] = await _rerank_openai(params.q, results)
-        except Exception as e:
-            out["rerank_error"] = str(e)
-
-    return out
-
-async def _rerank_openai(query: str, results: List[Dict[str, Any]], top_k: Optional[int] = None) -> List[Dict[str, Any]]:
-    """
-    Simple rerank: send query + candidates to OpenAI for scoring using a lightweight model.
-    We keep this simple and deterministic (no streaming). Requires OPENAI_API_KEY.
-    """
-    # Prepare candidate texts
-    cands = []
-    for r in results:
-        txt = r.get("text") or r.get("content") or json.dumps(r)  # robust
-        cands.append(txt)
-
-    # Truncate to a reasonable count to keep latency in check
-    limit = min(len(cands), top_k or DEFAULTS.top_k)
-    cands = cands[:limit]
-
-    # Use responses API with a simple instruction-style scoring
-    # (We avoid fancy tool calls to keep compatibility tight.)
-    prompt = (
-        "You are a ranking function. Score each candidate passage for relevance to the user query on a 0-100 scale.\n"
-        f"Query: {query}\n\n"
-        "Candidates:\n"
-    )
-    for i, c in enumerate(cands, 1):
-        prompt += f"[{i}] {c}\n"
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-4o-mini",
-        "input": [
-            {
-                "role": "user",
-                "content": prompt + "\nReturn a JSON array of numbers only (scores aligned with index order).",
-            }
-        ],
-        "temperature": 0,
-    }
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-        j = await r.json()
-        # Very defensive parse: try to read a JSON array from the model's text
-        out_text = ""
-        try:
-            out_text = j["output"][0]["content"][0]["text"]  # new Responses format
-        except Exception:
+        client = _http_client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_S, limits=http_limits, headers={"User-Agent": USER_AGENT})
+        close_after = client is not _http_client
+        resp = await client.post(
+            edge_url,
+            json={"query": query, "mode": mode, "top_k": top_k, "min_score": min_score},
+            headers=headers,
+        )
+        if close_after:
+            await client.aclose()
+        if resp.status_code == 200:
             try:
-                out_text = j["choices"][0]["message"]["content"]  # legacy compat
+                data = resp.json()
             except Exception:
-                out_text = ""
+                # treat invalid JSON as a terminal edge error response
+                return {"error": "invalid_edge_json", "text": resp.text[:500]}, None
+            return data if isinstance(data, dict) else {"results": data}, None
+        return None, f"edgefn_{resp.status_code}"
+    except Exception as e:
+        return None, f"edgefn_exc_{e}"
 
-        try:
-            scores = json.loads(out_text)
-            if not isinstance(scores, list):
-                raise ValueError("scores not a list")
-        except Exception:
-            # fallback: uniform scores if parse fails
-            scores = [50] * len(cands)
+async def _keyword_search_fallback(query: str, top_k: int, edge_err: str) -> Dict[str, Any]:
+    """Fallback to PostgREST keyword search against documents table."""
+    if not SUPABASE_URL or not (SUPABASE_ANON_KEY or SUPABASE_KEY):
+        return {"ok": False, "error": f"supabase_not_configured; edge_err={edge_err}", "items": []}
+    if not is_allowlisted(SUPABASE_URL):
+        return {"ok": False, "error": f"supabase_url_not_allowlisted; edge_err={edge_err}", "items": []}
 
-    # Attach scores and sort
-    scored = []
-    for idx, r in enumerate(results[:limit]):
-        rr = dict(r)
-        rr["_rerank"] = float(scores[idx] if idx < len(scores) else 50.0)
-        scored.append(rr)
-    scored.sort(key=lambda x: x.get("_rerank", 0.0), reverse=True)
-    return scored
+    headers = supabase_auth_headers(SUPABASE_ANON_KEY or SUPABASE_KEY)
+    params = {
+        "select": "id,title,preview",
+        "content": f"ilike.*{query}*",
+        "limit": str(top_k),
+    }
+    try:
+        client = _http_client or httpx.AsyncClient(timeout=HTTP_TIMEOUT_S, limits=http_limits, headers={"User-Agent": USER_AGENT})
+        close_after = client is not _http_client
+        r = await client.get(f"{SUPABASE_URL.rstrip('/')}/rest/v1/documents", params=params, headers=headers)
+        if close_after:
+            await client.aclose()
+        if r.status_code not in (200, 206):
+            return {"ok": False, "error": f"rest_{r.status_code}; edge_err={edge_err}", "items": []}
+        items = r.json() or []
+        return {"ok": True, "items": items, "fallback": True, "edge_err": edge_err}
+    except Exception as e:
+        return {"ok": False, "error": f"rest_exc_{e}; edge_err={edge_err}", "items": []}
 
-@mcp.tool(description="General search via Edge (vector|bm25|hybrid|semantic). Supports OpenAI rerank.")
-async def edge_search(params: SearchParams) -> Dict[str, Any]:
-    return await _edge_search_core(params)
+@mcp.tool(description="Hybrid search via Supabase EdgeFn with safe fallback to keyword PostgREST.")
+async def search(query: str, mode: str = "hybrid", top_k: int = 10, min_score: float = 0.0) -> Dict[str, Any]:
+    data, err = await _call_edge_function(query=query, mode=mode, top_k=top_k, min_score=min_score)
+    if data is not None:
+        return data
+    edge_err = err or "edgefn_unknown"
+    return await _keyword_search_fallback(query=query, top_k=top_k, edge_err=edge_err)
 
-@mcp.tool(description="BM25 search via Edge.")
-async def bm25_search(q: str, top_k: int = SEARCH_TOP_K, min_score: float = SEARCH_MIN_SCORE, rerank: bool = False) -> Dict[str, Any]:
-    return await _edge_search_core(SearchParams(q=q, mode="bm25", top_k=top_k, min_score=min_score, rerank=rerank))
+# ----------------------------
+# Host FastAPI and mount MCP at /mcp
+# ----------------------------
+main_app = FastAPI(title="Burns Legal MCP", version="1.0.0")
+allow_origins = ["*"] if ALLOWED_ORIGINS.strip() == "*" else _split_csv(ALLOWED_ORIGINS)
+main_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins or ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
-@mcp.tool(description="Vector similarity search via Edge.")
-async def vector_search(q: str, top_k: int = SEARCH_TOP_K, min_score: float = SEARCH_MIN_SCORE, rerank: bool = False) -> Dict[str, Any]:
-    return await _edge_search_core(SearchParams(q=q, mode="vector", top_k=top_k, min_score=min_score, rerank=rerank))
+http_limits = httpx.Limits(max_connections=HTTP_MAX_CONNECTIONS, max_keepalive_connections=HTTP_MAX_KEEPALIVE)
+_http_client: Optional[httpx.AsyncClient] = None
 
-@mcp.tool(description="Hybrid search (vector + BM25) via Edge.")
-async def hybrid_search(q: str, top_k: int = SEARCH_TOP_K, min_score: float = SEARCH_MIN_SCORE, rerank: bool = False) -> Dict[str, Any]:
-    return await _edge_search_core(SearchParams(q=q, mode="hybrid", top_k=top_k, min_score=min_score, rerank=rerank))
+@main_app.on_event("startup")
+async def _startup():
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_S, limits=http_limits, headers={"User-Agent": USER_AGENT})
 
-@mcp.tool(description="Semantic search (alias to hybrid unless Edge defines differently).")
-async def semantic_search(q: str, top_k: int = SEARCH_TOP_K, min_score: float = SEARCH_MIN_SCORE, rerank: bool = False) -> Dict[str, Any]:
-    return await _edge_search_core(SearchParams(q=q, mode="semantic", top_k=top_k, min_score=min_score, rerank=rerank))
+@main_app.on_event("shutdown")
+async def _shutdown():
+    global _http_client
+    try:
+        if _http_client is not None:
+            await _http_client.aclose()
+    finally:
+        _http_client = None
 
-@mcp.tool(description="Request embeddings for a query from Edge (action=embed_query).")
-async def embed_query(q: str) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    status, data, text = await _post_json(edge_url, {"action": "embed_query", "query": q}, headers)
-    if status != 200:
-        return {"ok": False, "status": status, "error": data if data else _truncate(text)}
-    emb = data.get("embedding") or data.get("vector") or []
-    return {"ok": True, "dim": len(emb), "embedding": emb}
+@main_app.get("/")
+async def root():
+    return {"ok": True}
 
-@mcp.tool(description="Label a document or match by posting to Edge (action=label).")
-async def label_result(params: LabelParams) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    body = {"action": "label", "doc_id": params.doc_id, "label": params.label}
-    status, data, text = await _post_json(edge_url, body, headers)
-    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
+@main_app.get("/health")
+async def health():
+    return {"status": "healthy", "app": "burns-legal-streamable"}
 
-@mcp.tool(description="List collections/sources from Edge if supported.")
-async def list_collections() -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    status, data, text = await _post_json(edge_url, {"action": "list_collections"}, headers)
-    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
-
-@mcp.tool(description="Fetch a document (by id) via Edge if supported.")
-async def get_document(doc_id: str) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    status, data, text = await _post_json(edge_url, {"action": "get_document", "doc_id": doc_id}, headers)
-    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
-
-@mcp.tool(description="Reciprocal Rank Fusion of two result sets (client-side).")
-async def combine_results(set_a: List[Dict[str, Any]], set_b: List[Dict[str, Any]], k: int = 60) -> Dict[str, Any]:
+# --- FastMCP 2.12.x compatibility shim ---
+def _compat_http_app(server: FastMCP, path: str = "/mcp"):
     """
-    RRF fusion: score = sum(1 / (k + rank))
-    Expects each set as list of dicts with a stable 'id' or 'doc_id'.
+    Compatibility shim for FastMCP 2.12.0 environments that lack `server.http_app`.
+
+    When FastCloud (or other deploy targets) import an MCP server module, they may
+    expect a callable ASGI app mounted at a path. FastMCP gained `http_app()` in
+    >= 2.12.2; older 2.12.0 builds do not have this attribute. In those cases:
+
+    - We expose a minimal FastAPI app so HTTP probing and import inspection succeed.
+    - The actual transport wiring is performed by the FastMCP CLI when the platform
+      executes `fastmcp run` with HTTP transport.
+    - This avoids double event loop issues (e.g., "Already running asyncio in this thread")
+      that can occur if the module tries to start its own runner during import time.
+
+    If `server.http_app` exists, we simply delegate to it.
     """
-    def index_by_id(items: List[Dict[str, Any]]) -> List[str]:
-        ids = []
-        for it in items:
-            ids.append(it.get("id") or it.get("doc_id") or json.dumps(it)[:64])
-        return ids
+    if hasattr(server, "http_app"):
+        return server.http_app(path=path)  # type: ignore[attr-defined]
+    # Minimal shim: mount a root "ok" while FastCloud uses the CLI to wire HTTP transport.
+    # This prevents 'inspect' from failing and keeps /mcp/ok probe working pre-run.
+    from fastapi import FastAPI
+    shim = FastAPI()
+    @shim.get("/")
+    async def ok():
+        return {"ok": True, "shim": "fastmcp-2.12.0"}
+    return shim
 
-    ids_a = index_by_id(set_a)
-    ids_b = index_by_id(set_b)
+try:
+    mcp_app = mcp.http_app(path="/mcp")  # >=2.12.2
+except Exception:
+    mcp_app = _compat_http_app(mcp, path="/mcp")  # 2.12.0 shim
 
-    scores: Dict[str, float] = {}
-    for rank, id_ in enumerate(ids_a, 1):
-        scores[id_] = scores.get(id_, 0.0) + 1.0 / (k + rank)
-    for rank, id_ in enumerate(ids_b, 1):
-        scores[id_] = scores.get(id_, 0.0) + 1.0 / (k + rank)
-
-    fused = []
-    seen: Dict[str, bool] = {}
-    # Reconstruct minimal rows, preferring set_a’s meta then set_b
-    def find_row(id_: str) -> Dict[str, Any]:
-        for it in set_a:
-            if (it.get("id") or it.get("doc_id")) == id_:
-                return dict(it)
-        for it in set_b:
-            if (it.get("id") or it.get("doc_id")) == id_:
-                return dict(it)
-        return {"id": id_}
-
-    for id_, sc in sorted(scores.items(), key=lambda kv: kv[1], reverse=True):
-        if id_ in seen:
-            continue
-        row = find_row(id_)
-        row["_rrf"] = sc
-        fused.append(row)
-        seen[id_] = True
-
-    return {"ok": True, "count": len(fused), "results": fused}
-
-# ---------------------------
-# Rerank Utilities (27-29)
-# ---------------------------
-
-@mcp.tool(description="Rerank a set of results with OpenAI (expects 'text' per item).")
-async def rerank_by_openai(query: str, results: List[Dict[str, Any]], top_k: Optional[int] = None) -> Dict[str, Any]:
-    if not OPENAI_API_KEY:
-        return {"ok": False, "error": "OPENAI_API_KEY not set"}
-    ranked = await _rerank_openai(query, results, top_k=top_k)
-    return {"ok": True, "results": ranked}
-
-@mcp.tool(description="BM25-like lightweight rerank (client-side heuristic).")
-async def rerank_by_bm25(query: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Very simple BM25-ish scoring (heuristic). Not a full implementation; useful as a client-side tiebreaker.
-    """
-    q_terms = [t for t in query.lower().split() if t]
-    def score(txt: str) -> float:
-        t = txt.lower()
-        hits = sum(t.count(qt) for qt in q_terms)
-        return float(hits)
-    scored = []
-    for r in results:
-        txt = r.get("text") or r.get("content") or ""
-        rr = dict(r)
-        rr["_bm25h"] = score(txt)
-        scored.append(rr)
-    scored.sort(key=lambda x: x.get("_bm25h", 0.0), reverse=True)
-    return {"ok": True, "results": scored}
-
-@mcp.tool(description="Combine OpenAI rerank (first) then BM25 heuristic as a tie resolver.")
-async def rerank_hybrid(query: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    first = await rerank_by_openai(query, results)
-    if not first.get("ok"):
-        return first
-    # Apply BM25 heuristic to top 2 ties if scores identical
-    ranked = first["results"]
-    if len(ranked) >= 2 and ranked[0].get("_rerank") == ranked[1].get("_rerank"):
-        tie = await rerank_by_bm25(query, ranked[:2])
-        # Prefer one with higher bm25h
-        tie_sorted = tie["results"]
-        anchored = tie_sorted + ranked[2:]
-        return {"ok": True, "results": anchored}
-    return {"ok": True, "results": ranked}
-
-# ---------------------------
-# Defaults Management (30-32)
-# ---------------------------
-
-@mcp.tool(description="Set session defaults (mode/top_k/min_score/etc).")
-async def set_defaults(params: SetDefaultsParams) -> Dict[str, Any]:
-    if params.mode:
-        DEFAULTS.mode = params.mode.lower()
-    if params.top_k is not None:
-        DEFAULTS.top_k = params.top_k
-    if params.min_score is not None:
-        DEFAULTS.min_score = params.min_score
-    if params.lexical_k is not None:
-        DEFAULTS.lexical_k = params.lexical_k
-    if params.max_fetch_size is not None:
-        globals()["MAX_FETCH_SIZE"] = int(params.max_fetch_size)
-    if params.snippet_length is not None:
-        globals()["SNIPPET_LENGTH"] = int(params.snippet_length)
-    return {"ok": True, "defaults": DEFAULTS.model_dump()}
-
-@mcp.tool(description="Get session defaults.")
-async def get_defaults() -> Dict[str, Any]:
-    return {"ok": True, "defaults": DEFAULTS.model_dump()}
-
-@mcp.tool(description="Reset session defaults to startup values.")
-async def reset_defaults() -> Dict[str, Any]:
-    DEFAULTS.mode = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()
-    DEFAULTS.top_k = int(os.getenv("SEARCH_TOP_K", "10"))
-    DEFAULTS.min_score = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
-    DEFAULTS.lexical_k = int(os.getenv("LEXICAL_K", "0"))
-    globals()["MAX_FETCH_SIZE"] = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
-    globals()["SNIPPET_LENGTH"] = int(os.getenv("SNIPPET_LENGTH", "500"))
-    return {"ok": True, "defaults": DEFAULTS.model_dump()}
-
-# ---------------------------
-# Generic Edge Actions (33)
-# ---------------------------
-
-@mcp.tool(description="Call Edge with a raw action/payload (advanced).")
-async def edge_action(params: EdgeActionParams) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    body = dict(params.payload or {})
-    body["action"] = params.action
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    status, data, text = await _post_json(edge_url, body, headers)
-    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
-
-# ---------------------------
-# ASGI app export for FastCloud
-# ---------------------------
-
-def build_app():
-    # Build a FastAPI app and mount MCP under /mcp; add HTTP /health
-    app = FastAPI()
-
-    # HTTP /health endpoint
-    @app.get("/health")
-    async def health_http():
-        edge_url = _resolve_edge_url()
-        ok, host = _is_host_allowlisted(edge_url)
-        if not ok:
-            return {"ok": False, "edge": {"url": edge_url, "error": f"host '{host}' not in allowlist"}}
-        headers = make_edge_headers()
-        status, data, text = await _post_json(edge_url, {"ping": True}, headers)
-        return {
-            "ok": status == 200,
-            "edge": {"url": edge_url, "status": status, "body": data if data else _truncate(text)},
-            "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        }
-
-    # Mount MCP server at /mcp (FastMCP 2.12.x: no path kwarg on http_app)
-    app.mount("/mcp", mcp.http_app())
-    return app
-
-# Exported for platform discovery (FastCloud)
-app = build_app()
+main_app.mount("/mcp", mcp_app)
+app = main_app  # ASGI export for local uvicorn if used
 
 if __name__ == "__main__":
-    # Local dev only (FastCloud uses its own runner; this block won't execute there)
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
