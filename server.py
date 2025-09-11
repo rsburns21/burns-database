@@ -251,81 +251,12 @@ async def search(query: str, mode: str = "hybrid", top_k: int = 10, min_score: f
     return await _keyword_search_fallback(query=query, top_k=top_k, edge_err=edge_err)
 
 # ----------------------------
-# Host FastAPI and mount MCP at /mcp
+# Export HTTP app (FastCloud hosts it)
 # ----------------------------
-main_app = FastAPI(title="Burns Legal MCP", version="1.0.0")
-allow_origins = ["*"] if ALLOWED_ORIGINS.strip() == "*" else _split_csv(ALLOWED_ORIGINS)
-main_app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allow_origins or ["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
+# Provide a simple health route on the MCP app
+@mcp.custom_route("/health", methods=["GET"])
+async def _health(_req):
+    return JSONResponse({"status": "healthy", "app": "burns-legal-streamable"}, status_code=200)
 
-http_limits = httpx.Limits(max_connections=HTTP_MAX_CONNECTIONS, max_keepalive_connections=HTTP_MAX_KEEPALIVE)
-_http_client: Optional[httpx.AsyncClient] = None
-
-@main_app.on_event("startup")
-async def _startup():
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_S, limits=http_limits, headers={"User-Agent": USER_AGENT})
-
-@main_app.on_event("shutdown")
-async def _shutdown():
-    global _http_client
-    try:
-        if _http_client is not None:
-            await _http_client.aclose()
-    finally:
-        _http_client = None
-
-@main_app.get("/")
-async def root():
-    return {"ok": True}
-
-@main_app.get("/health")
-async def health():
-    return {"status": "healthy", "app": "burns-legal-streamable"}
-
-# --- FastMCP 2.12.x compatibility shim ---
-def _compat_http_app(server: FastMCP, path: str = "/mcp"):
-    """
-    Compatibility shim for FastMCP 2.12.0 environments that lack `server.http_app`.
-
-    When FastCloud (or other deploy targets) import an MCP server module, they may
-    expect a callable ASGI app mounted at a path. FastMCP gained `http_app()` in
-    >= 2.12.2; older 2.12.0 builds do not have this attribute. In those cases:
-
-    - We expose a minimal FastAPI app so HTTP probing and import inspection succeed.
-    - The actual transport wiring is performed by the FastMCP CLI when the platform
-      executes `fastmcp run` with HTTP transport.
-    - This avoids double event loop issues (e.g., "Already running asyncio in this thread")
-      that can occur if the module tries to start its own runner during import time.
-
-    If `server.http_app` exists, we simply delegate to it.
-    """
-    if hasattr(server, "http_app"):
-        return server.http_app(path=path)  # type: ignore[attr-defined]
-    # Minimal shim: mount a root "ok" while FastCloud uses the CLI to wire HTTP transport.
-    # This prevents 'inspect' from failing and keeps /mcp/ok probe working pre-run.
-    from fastapi import FastAPI
-    shim = FastAPI()
-    @shim.get("/")
-    async def ok():
-        return {"ok": True, "shim": "fastmcp-2.12.0"}
-    return shim
-
-try:
-    mcp_app = mcp.http_app(path="/mcp")  # >=2.12.2
-except Exception:
-    mcp_app = _compat_http_app(mcp, path="/mcp")  # 2.12.0 shim
-
-main_app.mount("/mcp", mcp_app)
-app = main_app  # ASGI export for local uvicorn if used
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+# Export the ASGI app directly from FastMCP
+app = mcp.http_app()
