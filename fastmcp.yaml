@@ -5,7 +5,7 @@ description: Burns Database MCP server (FastMCP HTTP) targeting Supabase Edge fu
 cloud:
   provider: fastmcp
   region: us-east-1
-  subdomain: BurnsDB
+  subdomain: burnsdb
 
 server:
   main: server.py
