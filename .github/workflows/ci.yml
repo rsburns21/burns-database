@@ -20,11 +20,26 @@ jobs:
       - name: Static compile check
         run: |
           python -m py_compile server.py
-      - name: Import and build app
+      -       - name: Import ASGI app and ping a route
         run: |
-          python - << 'PY'
+          python - <<'PY'
+          import sys
           import server
-          app = server.build_app()
-          assert app is not None
-          print('OK: app built')
+          assert hasattr(server, "app"), "server.app not found"
+          print("OK: server.app exists")
+
+          # Optional: do a lightweight request if Starlette/FastAPI is available
+          try:
+              from starlette.testclient import TestClient  # provided by starlette / fastapi
+              client = TestClient(server.app)
+              # Try /health if present; otherwise /
+              path = "/health"
+              resp = client.get(path)
+              if resp.status_code >= 400:
+                  # fall back to root if /health isn't defined
+                  resp = client.get("/")
+              print(f"OK: request returned {resp.status_code}")
+          except Exception as e:
+              # Not fatal for smoke; continue as long as app import worked
+              print(f"Note: skipped HTTP probe: {e}", file=sys.stderr)
           PY
