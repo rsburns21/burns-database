@@ -12,7 +12,7 @@ Quick start (local):
 
 FastCloud deploy:
 - Configure GitHub Variables: `SUPABASE_URL`, `PORT` (8080), `ENABLE_DIAG` (0/1), `APP_NAME` (burnsdb)
-- Configure GitHub Secrets: `SUPABASE_SERVICE_ROLE_KEY` (required), optionally `SUPABASE_ANON_KEY`, `OPENAI_API_KEY`
+- Configure GitHub Secrets: `SUPABASE_SERVICE_ROLE_KEY` (required), optionally `OPENAI_API_KEY`
 - Push to `main` to trigger deploy
 
 ChatGPT MCP connector (client-side):

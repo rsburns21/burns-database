@@ -38,12 +38,8 @@ SERVER_VERSION = "4.3.0"
 EDGEFN_URL_DEFAULT = "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search"
 EDGEFN_URL = os.getenv("EDGEFN_URL", EDGEFN_URL_DEFAULT).strip()
 
-# Auth mode: "service_role" (preferred for privileged edge), "supabase" (anon), or "none"
-EDGEFN_AUTH_MODE = (os.getenv("EDGEFN_AUTH_MODE") or "service_role").strip().lower()
-
-# Keys (service role preferred on server side)
+# Keys (service role only for server-to-server)
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or ""
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # optional catch-all
 
 # OpenAI (used for rerank)
@@ -86,31 +82,16 @@ EMBED_DIM = int(os.getenv("EMBED_DIM", "384"))
 def _resolve_edge_url() -> str:
     return EDGEFN_URL
 
-def _choose_edge_jwt(mode: str = EDGEFN_AUTH_MODE) -> Optional[str]:
+def make_edge_headers() -> Dict[str, str]:
     """
-    Return the best key for calling the Edge Function.
-    Accept service role and anon API keys even if they are not JWTs.
-    """
-    m = (mode or "").lower()
-    if m == "service_role":
-        return SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY or SUPABASE_ANON_KEY
-    if m in ("supabase", "apikey"):
-        return SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
-    if m == "none":
-        return None
-    # default fallback
-    return SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
-
-def make_edge_headers(mode: str = EDGEFN_AUTH_MODE) -> Dict[str, str]:
-    """
-    Always include apikey and Authorization when we have a key
-    (covers both JWT-like and opaque service-role strings).
+    Always include apikey and Authorization when a key is available.
+    Supports opaque service-role strings (non-JWT) and JWTs alike.
     """
     headers: Dict[str, str] = {"Content-Type": "application/json"}
-    key = _choose_edge_jwt(mode)
+    # Prefer explicit service role, then SUPABASE_KEY catch-all
+    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
     if key:
-        headers["apikey"] = key
-        headers["Authorization"] = f"Bearer {key}"
+        headers.update({"apikey": key, "Authorization": f"Bearer {key}"})
     return headers
 
 def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
@@ -205,7 +186,7 @@ async def echo(text: str) -> Dict[str, Any]:
 async def list_capabilities() -> Dict[str, Any]:
     return {
         "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        "edge": {"url": _resolve_edge_url(), "auth_mode": EDGEFN_AUTH_MODE},
+        "edge": {"url": _resolve_edge_url()},
         "defaults": DEFAULTS.model_dump(),
         "allowlist_hosts": ALLOWLIST_HOSTS,
         "embed_dim": EMBED_DIM,
@@ -308,10 +289,9 @@ async def diag_edge(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 async def diag_config() -> Dict[str, Any]:
     return {
         "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        "edge": {"url": _resolve_edge_url(), "auth_mode": EDGEFN_AUTH_MODE},
+        "edge": {"url": _resolve_edge_url()},
         "env_presence": {
             "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_SERVICE_ROLE_KEY),
-            "SUPABASE_ANON_KEY": bool(SUPABASE_ANON_KEY),
             "OPENAI_API_KEY": bool(OPENAI_API_KEY),
         },
         "allowlist_hosts": ALLOWLIST_HOSTS,
