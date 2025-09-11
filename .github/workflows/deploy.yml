@@ -1,22 +1,57 @@
-name: Deploy (manual)
+name: Deploy to FastAPI Cloud
 
 on:
-  workflow_dispatch:
-    inputs:
-      supabase_url:
-        description: 'Supabase URL (optional override)'
-        required: false
-      app_name:
-        description: 'App name (FastCloud)'
-        required: false
-        default: 'burnsdb'
+  push:
+    branches: [ main ]
 
 jobs:
-  noop:
+  deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
-      - name: Note
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FastAPI Cloud CLI
         run: |
-          echo "Deployment is managed by FastMCP Cloud via GitHub integration."
-          echo "Connect this repo in the FastCloud UI and set env vars + start command."
-          echo "This workflow exists only for manual checks or future automation."
+          python -m pip install --upgrade pip
+          # EITHER of these is fine; pick ONE:
+          pip install fastapi-cloud-cli
+          # pip install "fastapi[standard]"
+
+      - name: Deploy
+        env:
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_ANON_KEY:        ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_URL:             ${{ vars.SUPABASE_URL }}
+          OPENAI_API_KEY:           ${{ secrets.OPENAI_API_KEY }}
+          APP_NAME:                 ${{ vars.APP_NAME }}
+          PORT:                     ${{ vars.PORT }}
+          ENABLE_DIAG:              ${{ vars.ENABLE_DIAG }}
+        run: |
+          APP_NAME_FIXED=${APP_NAME:-burnsdb}
+          PORT_FIXED=${PORT:-8080}
+          # FastAPI Cloud CLI uses the `fastapi` command
+          fastapi deploy \
+            --app "${APP_NAME_FIXED}" \
+            --start "uvicorn server:app --host 0.0.0.0 --port ${PORT_FIXED}" \
+            --env SUPABASE_URL="${SUPABASE_URL}" \
+            --env SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SERVICE_ROLE_KEY}" \
+            --env SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY}" \
+            --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
+            --env PORT="${PORT_FIXED}" \
+            --env ENABLE_DIAG="${ENABLE_DIAG}" \
+            --env EDGEFN_AUTH_MODE="service_role"
+
+      - name: Set healthcheck route (best effort)
+        if: always()
+        run: |
+          # Some CLIs expose a healthcheck subcommand; safe to ignore failures
+          fastapi healthcheck set --app "${APP_NAME:-burnsdb}" --path "/mcp" || true
