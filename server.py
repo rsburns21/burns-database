@@ -6,19 +6,19 @@ Deployment-safe server module for FastCloud:
 
 - Exports `app` at module import time (NO uvicorn.run(), NO event-loop starts).
 - Uses FastMCP SDK HTTP app directly; FastCloud will host it at port 8080.
-- FastCloud auth handles user authentication; NO MCP_API_KEY required.
+- Auth is handled by FastCloud (no bearer checks here).
 - Supabase access uses SERVICE ROLE KEY (from FastCloud secrets) for Edge Function calls & DB.
 - Edge Function endpoint is STATIC and singular (advanced_semantic_search).
 
 Environment (minimal; set via FastCloud):
   SUPABASE_URL=https://nqkzqcsqfvpquticvwmk.supabase.co
   SUPABASE_SERVICE_ROLE_KEY=<set in FastCloud Secrets>
-  OPENAI_API_KEY=<set in FastCloud Secrets, if you will use OpenAI tools>
 Optional:
-  ALLOWLIST_HOSTS= n q k z q c s q f v p q u t i c v w m k.supabase.co,nqkzqcsqfvpquticvwmk.functions.supabase.co,api.openai.com,chatgpt.com,raw.githubusercontent.com,httpbin.org,playground.ai.cloudflare.com,example.com
+  ALLOWLIST_HOSTS=nqkzqcsqfvpquticvwmk.supabase.co,nqkzqcsqfvpquticvwmk.functions.supabase.co,api.openai.com,chatgpt.com,raw.githubusercontent.com,httpbin.org,playground.ai.cloudflare.com,example.com
   MAX_FETCH_SIZE=1000000
   SNIPPET_LENGTH=500
   ENABLE_DIAG=1
+  FASTCLOUD_MCP_URL=https://burnsdb.fastmcp.app/mcp   # used by /openai/hosted-tool helper
 
 NOTE: This file purposefully avoids any FastAPI/Starlette `on_event` startup/shutdown handlers
 to prevent the "Already running asyncio in this thread" crash under FastCloud.
@@ -43,7 +43,6 @@ except Exception as e:
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://nqkzqcsqfvpquticvwmk.supabase.co").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-# If you want anon-key fallbacks for read-only paths, you could add them here.
 # This server intentionally uses ONLY the service role key for Supabase access.
 SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY
 
@@ -131,7 +130,17 @@ async def _health(_request):
     }
     return JSONResponse(info, status_code=200)
 
-# Optional diagnostics
+# Helper for OpenAI Agents SDK / GPT Builder wiring
+@mcp.custom_route("/openai/hosted-tool", methods=["GET"])
+async def _openai_hosted_tool(_request):
+    """
+    Convenience endpoint: returns a minimal object you can pass to OpenAI
+    Agents SDK `hostedMcpTool({ label, url })`, or configure in a GPT tool.
+    """
+    url = os.getenv("FASTCLOUD_MCP_URL", "https://burnsdb.fastmcp.app/mcp")
+    return JSONResponse({"label": "BurnsDB", "url": url}, status_code=200)
+
+# ---------- Optional diagnostics ----------
 if _ENABLE_DIAG:
     @mcp.custom_route("/diag/edge", methods=["GET"])
     async def _diag_edge(_request):
@@ -141,7 +150,7 @@ if _ENABLE_DIAG:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 r = await client.post(EDGE_FUNCTION_URL, json={"ping": True}, headers=_edge_headers())
             try:
-                body = await r.json()
+                body = r.json()
             except Exception:
                 body = {"_text": r.text[:500]}
             return JSONResponse({"ok": r.status_code == 200, "status": r.status_code, "body": body}, status_code=200)
@@ -181,18 +190,33 @@ async def edge_search(query: str, top_k: int = 10, mode: str = "hybrid") -> Dict
     if resp.status_code != 200:
         return {"ok": False, "error": f"edge_function_error_{resp.status_code}", "text": resp.text[:500], "results": []}
     try:
-        data = await resp.json()
+        data = resp.json()
     except Exception:
         return {"ok": False, "error": "invalid_json_from_edge", "text": resp.text[:500], "results": []}
     if not isinstance(data, list):
         return {"ok": False, "error": "invalid_response_format", "results": []}
     return {"ok": True, "results": data}
 
+# Canonical search tool expected by some ChatGPT connectors
+@mcp.tool()
+async def search(query: str, limit: int = 10) -> Dict[str, Any]:
+    """
+    Canonical search: returns IDs + snippets so `fetch()` can retrieve full content.
+    """
+    base = await edge_search(query=query, top_k=limit, mode="hybrid")
+    if not base.get("ok"):
+        return {"ok": False, "error": base.get("error", "search_failed"), "results": []}
+    items: List[Dict[str, Any]] = []
+    for r in base.get("results", []):
+        ex = r.get("exhibit_id") or r.get("id") or "Unknown"
+        text = r.get("text") or r.get("chunk") or r.get("content") or ""
+        score = r.get("score") or r.get("similarity")
+        items.append({"id": ex, "snippet": _snippet(str(text)), "score": score})
+    return {"ok": True, "results": items}
+
 @mcp.tool()
 async def search_legal(query: str, top_k: int = 10) -> Dict[str, Any]:
-    """
-    High-level semantic/hybrid search with concise snippets.
-    """
+    """High-level semantic/hybrid search with concise snippets."""
     res = await edge_search(query=query, top_k=top_k, mode="hybrid")
     if not res.get("ok"):
         return res
@@ -230,7 +254,6 @@ async def rerank(results: List[Dict[str, Any]], method: str = "relevance") -> Di
         except Exception:
             out = results
     elif m == "recency":
-        # if exhibit dates exist, you could wire a DB lookup here. Leave stable.
         out = results
     elif m in ("rrf", "reciprocal rank fusion"):
         out = results
@@ -240,11 +263,8 @@ async def rerank(results: List[Dict[str, Any]], method: str = "relevance") -> Di
 
 @mcp.tool()
 async def label_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Assign lightweight labels to results (e.g., CONTRACT / EVIDENCE / DAMAGES).
-    """
+    """Assign lightweight labels to results (e.g., CONTRACT / EVIDENCE / DAMAGES)."""
     labeled = []
-    # Enrich from exhibits table if possible
     for r in results:
         ex = r.get("exhibit_id") or r.get("id") or ""
         desc, fname = "", ""
@@ -303,7 +323,7 @@ def fetch_exhibit(exhibit_id: str) -> Dict[str, Any]:
     try:
         meta_resp = _supabase.table("exhibits").select("description,filename").eq("Exhibit_ID", eid).limit(1).execute()
         if meta_resp.data:
-            meta.update({k: meta_resp.data[0].get(k) for k in ("description", "filename")})
+            meta.update({k: v for k, v in meta_resp.data[0].items() if k in ("description", "filename")})
     except Exception:
         pass
     return {"ok": True, **meta, "pages": pages}
@@ -338,7 +358,6 @@ def keyword_search(query: str, top_k: int = 10) -> Dict[str, Any]:
     if not _supabase:
         return {"ok": False, "error": "supabase_client_not_initialized", "items": []}
     try:
-        # Using PostgREST text_search helper
         resp = (_supabase.table("vector_embeddings")
                 .select("exhibit_id,text,similarity")
                 .text_search("text", query, {"config": "english", "type": "websearch"})
@@ -350,11 +369,11 @@ def keyword_search(query: str, top_k: int = 10) -> Dict[str, Any]:
     items = [{"exhibit_id": r.get("exhibit_id", "Unknown"), "snippet": _snippet(r.get("text", ""))} for r in rows]
     return {"ok": True, "items": items}
 
-# ---------- Fetch utilities ----------
+# ---------- HTTP fetch utilities (non-canonical) ----------
 
 @mcp.tool()
-def fetch(url: str) -> Dict[str, Any]:
-    """Fetch arbitrary URL content (allowlist + size cap)."""
+def http_fetch(url: str) -> Dict[str, Any]:
+    """HTTP GET with allowlist + size cap (renamed to avoid clashing with canonical `fetch`)."""
     if not _host_allowed(url):
         return {"ok": False, "error": "host_not_allowed"}
     try:
@@ -369,8 +388,8 @@ def fetch(url: str) -> Dict[str, Any]:
 
 @mcp.tool()
 def fetch_allowed(url: str) -> Dict[str, Any]:
-    """Alias of fetch() with allowlist enforced."""
-    return fetch(url)
+    """Alias of http_fetch() with allowlist enforced."""
+    return http_fetch(url)
 
 # ---------- Case data helpers ----------
 
@@ -465,12 +484,34 @@ def get_individuals(role: Optional[str] = None) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"fetch_error:{e}", "individuals": []}
 
+# ---------- Canonical fetch tool (IDs -> full content) ----------
+
+@mcp.tool()
+def fetch(ids: List[str]) -> Dict[str, Any]:
+    """
+    Canonical fetch for ChatGPT connectors.
+    Given exhibit IDs, return full documents/content for each.
+    """
+    out: List[Dict[str, Any]] = []
+    for eid in ids or []:
+        res = fetch_exhibit(eid)
+        if not res.get("ok"):
+            out.append({"id": eid, "ok": False, "error": res.get("error", "fetch_failed")})
+            continue
+        pages = res.get("pages", []) or []
+        content = "\n\n".join(pages) if isinstance(pages, list) else str(pages)
+        meta = {k: v for k, v in res.items() if k in ("exhibit_id", "description", "filename")}
+        out.append({"id": res.get("exhibit_id", eid), "ok": True, "content": content, "metadata": meta})
+    return {"ok": True, "documents": out}
+
 # ---------- Utility/Info Tools ----------
 
 @mcp.tool()
 def list_capabilities() -> Dict[str, Any]:
     """Enumerate tool names & brief descriptions."""
     tools = [
+        {"name": "search", "desc": "Canonical search: returns IDs + snippets"},
+        {"name": "fetch", "desc": "Canonical fetch: returns full content by IDs"},
         {"name": "edge_search", "desc": "Edge Function search (hybrid/vector/bm25)"},
         {"name": "search_legal", "desc": "Hybrid search with snippets"},
         {"name": "bm25_search", "desc": "BM25-only search via Edge Function"},
@@ -480,6 +521,8 @@ def list_capabilities() -> Dict[str, Any]:
         {"name": "fetch_exhibit", "desc": "Retrieve full pages for an exhibit"},
         {"name": "list_exhibits", "desc": "List exhibits (optionally labeled)"},
         {"name": "keyword_search", "desc": "Direct BM25-ish keyword search via PostgREST"},
+        {"name": "http_fetch", "desc": "HTTP GET with allowlist & size caps"},
+        {"name": "fetch_allowed", "desc": "Alias of http_fetch"},
         {"name": "list_claims", "desc": "List all claims (optional status filter)"},
         {"name": "get_facts_by_claim", "desc": "Facts for a given claim"},
         {"name": "get_facts_by_exhibit", "desc": "Facts for a given exhibit"},
@@ -487,8 +530,6 @@ def list_capabilities() -> Dict[str, Any]:
         {"name": "get_case_timeline", "desc": "Static example timeline"},
         {"name": "get_entities", "desc": "Entities list"},
         {"name": "get_individuals", "desc": "Individuals list"},
-        {"name": "fetch", "desc": "HTTP GET with allowlist & size caps"},
-        {"name": "fetch_allowed", "desc": "Alias of fetch"},
         {"name": "list_capabilities", "desc": "This list"},
     ]
     return {"ok": True, "tools": tools}
