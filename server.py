@@ -150,6 +150,21 @@ mcp = FastMCP("burns-legal-streamable")
 async def _root_ok(_req):
     return PlainTextResponse("ok", status_code=200)
 
+# OpenAI wrapper helper for ChatGPT hosted MCP
+@mcp.custom_route("/openai/hosted-tool", methods=["GET"])
+async def _openai_tool(_request):
+    """
+    Returns a JSON block that ChatGPT's hostedMcpTool() can use
+    to connect to this server without additional headers. Auth is
+    handled by the hosting layer (e.g., FastCloud).
+    """
+    base_url = os.getenv("FASTCLOUD_URL", "https://burnsdb.fastmcp.app/mcp").strip()
+    tool_def = {
+        "label": "BurnsDB",
+        "url": base_url,
+    }
+    return JSONResponse(tool_def, status_code=200)
+
 # Optional diagnostic route
 if ENABLE_DIAG:
     @mcp.custom_route("/diag/supabase", methods=["GET"])
