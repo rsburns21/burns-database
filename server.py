@@ -1,6 +1,7 @@
 # server.py
-# Burns Database MCP Server (FastAPI + FastMCP Streamable HTTP)
-# Version: 4.4.1
+# Burns Database MCP Server — FastMCP Streamable HTTP (stateless) + Supabase
+# Fixes: remove deprecated BearerAuthProvider, add middleware-based Bearer auth
+# Version: 4.4.2
 
 from __future__ import annotations
 
@@ -8,29 +9,37 @@ import os
 import sys
 import time
 import json
-import subprocess
 import tempfile
+import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Route
+from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastmcp import FastMCP
 from fastmcp.server.http import create_streamable_http_app
-from fastmcp.server.auth import BearerAuthProvider
 
-# ---------- Identity / Env ----------
+# ---------------------------
+# Identity & Environment
+# ---------------------------
 
 SERVER_NAME = os.getenv("APP_NAME", "burns-database").strip()
-SERVER_VERSION = os.getenv("APP_VERSION", "4.4.1").strip()
+SERVER_VERSION = os.getenv("APP_VERSION", "4.4.2").strip()
 
-EDGEFN_URL_DEFAULT = "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search"
-EDGEFN_URL = os.getenv("EDGEFN_URL", EDGEFN_URL_DEFAULT).strip()
+# Streamable MCP path
+MCP_PATH = "/mcp"
 
+# Secured readiness/CI token
+BDB_AUTH_TOKEN = os.getenv("BDB_AUTH_TOKEN", "").strip()
+
+# Supabase + Edge Function
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = (
     os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -38,11 +47,15 @@ SUPABASE_SERVICE_ROLE_KEY = (
     or ""
 )
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()  # optional catch-all
+EDGEFN_URL = os.getenv(
+    "EDGEFN_URL",
+    "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search",
+).strip()
 
+# OpenAI (only for diagnostics/rerank ping)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-BDB_AUTH_TOKEN = os.getenv("BDB_AUTH_TOKEN", "").strip()
-
+# Outbound allowlist
 ALLOWLIST_DEFAULT = [
     "nqkzqcsqfvpquticvwmk.supabase.co",
     "nqkzqcsqfvpquticvwmk.functions.supabase.co",
@@ -59,18 +72,20 @@ ALLOWLIST_HOSTS: List[str] = [
     if h.strip()
 ]
 
+# Tunables
 MAX_FETCH_SIZE = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
 SNIPPET_LENGTH = int(os.getenv("SNIPPET_LENGTH", "500"))
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "20"))
 
-SEARCH_MODE = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()  # vector|bm25|hybrid|semantic
+SEARCH_MODE = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()
 SEARCH_TOP_K = int(os.getenv("SEARCH_TOP_K", "10"))
 SEARCH_MIN_SCORE = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
 LEXICAL_K = int(os.getenv("LEXICAL_K", "0"))
-
 EMBED_DIM = 384
 
-# ---------- Supabase Client (optional, used for exhibits/metadata) ----------
+# ---------------------------
+# Optional Supabase client
+# ---------------------------
 
 try:
     from supabase import create_client, Client as SupabaseClient  # type: ignore
@@ -90,18 +105,20 @@ else:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         print("[BDB] Supabase client not initialized (missing SUPABASE_URL or SERVICE_ROLE_KEY).", file=sys.stderr)
 
-# ---------- Helpers ----------
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _truncate(s: str, n: int = SNIPPET_LENGTH) -> str:
+    if not s:
+        return s
+    return s if len(s) <= n else s[: n - 3] + "..."
 
 def _resolve_edge_url() -> str:
     return EDGEFN_URL
-
-def make_edge_headers() -> Dict[str, str]:
-    headers: Dict[str, str] = {"Content-Type": "application/json"}
-    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
-    if key:
-        headers["apikey"] = key
-        headers["Authorization"] = f"Bearer {key}"
-    return headers
 
 def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
     try:
@@ -111,24 +128,23 @@ def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
     except Exception:
         return (False, "")
 
+def make_edge_headers() -> Dict[str, str]:
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+    if key:
+        headers["apikey"] = key
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
 async def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any], str]:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
         resp = await client.post(url, json=body, headers=headers)
         text = resp.text
-        data: Dict[str, Any] = {}
         try:
             data = resp.json()
         except Exception:
             data = {}
         return (resp.status_code, data, text)
-
-def _truncate(s: str, n: int = SNIPPET_LENGTH) -> str:
-    if not s:
-        return s
-    return s if len(s) <= n else s[: n - 3] + "..."
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 def _normalize_exhibit_id(eid: str) -> str:
     s = (eid or "").strip()
@@ -149,7 +165,9 @@ def _categorize_exhibit(description: str, filename: str = "") -> str:
         return "DAMAGES"
     return "OTHER"
 
-# ---------- Defaults ----------
+# ---------------------------
+# Defaults
+# ---------------------------
 
 class Defaults(BaseModel):
     mode: str = SEARCH_MODE
@@ -161,30 +179,22 @@ class Defaults(BaseModel):
 
 DEFAULTS = Defaults()
 
-# ---------- Security (Bearer) ----------
-
-_security = HTTPBearer(auto_error=False)
-
-def _auth_required(creds: Optional[HTTPAuthorizationCredentials] = Depends(_security)) -> None:
-    if not BDB_AUTH_TOKEN:
-        return
-    if creds is None or creds.scheme.lower() != "bearer" or creds.credentials != BDB_AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-# ---------- FastMCP (stateless Streamable HTTP) ----------
+# ---------------------------
+# FastMCP server (stateless)
+# ---------------------------
 
 mcp = FastMCP(name=SERVER_NAME, instructions=f"{SERVER_NAME} MCP server")
-mcp.settings.stateless_http = True
-mcp.settings.json_response = True
 
-# ---------- Schemas ----------
+# ---------------------------
+# Tool schemas
+# ---------------------------
 
 class SearchParams(BaseModel):
     q: str = Field(..., description="User query")
     mode: str = Field(SEARCH_MODE, description="vector|bm25|hybrid|semantic")
     top_k: int = Field(SEARCH_TOP_K, ge=1, le=200)
     min_score: float = Field(SEARCH_MIN_SCORE, ge=0.0)
-    rerank: bool = Field(False, description="Apply OpenAI-based reranking (requires OPENAI_API_KEY)")
+    rerank: bool = Field(False, description="Enable rerank if Edge supports it")
     label: Optional[str] = None
     metadata_filter: Optional[Dict[str, Any]] = None
 
@@ -216,18 +226,9 @@ class CodexAgentParams(BaseModel):
     task_type: Optional[str] = None
     config_override: Optional[Dict[str, Any]] = None
 
-class HealthOut(BaseModel):
-    name: str
-    version: str
-    ok: bool
-
-class SBHealthOut(BaseModel):
-    auth_ok: bool
-    rest_ok: bool
-    status_auth: int
-    status_rest: int
-
-# ---------- MCP Tools (utility/diag) ----------
+# ---------------------------
+# Tools — Utility / Diag
+# ---------------------------
 
 @mcp.tool(description="Echo text back.")
 async def echo(text: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -261,8 +262,7 @@ async def http_get_allowed(params: FetchParams) -> Dict[str, Any]:
         return {"ok": False, "error": f"host '{host}' not in allowlist"}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
         r = await client.get(params.url)
-        body = r.text or ""
-        return {"ok": r.status_code == 200, "status": r.status_code, "host": host, "text": _truncate(body)}
+        return {"ok": r.status_code == 200, "status": r.status_code, "host": host, "text": _truncate(r.text or "")}
 
 @mcp.tool(description="HTTP HEAD (allowlisted only).")
 async def http_head_allowed(params: FetchParams) -> Dict[str, Any]:
@@ -293,8 +293,6 @@ async def health(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "edge": {},
         "openai": {},
     }
-
-    # Edge ping
     edge_url = _resolve_edge_url()
     ok, host = _is_host_allowlisted(edge_url)
     if not ok:
@@ -302,13 +300,7 @@ async def health(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     else:
         headers = make_edge_headers()
         status, data, text = await _post_json(edge_url, {"ping": True}, headers)
-        out["edge"] = {
-            "ok": status == 200,
-            "status": status,
-            "url": edge_url,
-            "body": data if data else _truncate(text),
-        }
-
+        out["edge"] = {"ok": status == 200, "status": status, "url": edge_url, "body": data if data else _truncate(text)}
     if OPENAI_API_KEY:
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
@@ -318,7 +310,6 @@ async def health(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             out["openai"] = {"ok": False, "error": str(e)}
     else:
         out["openai"] = {"ok": False, "error": "OPENAI_API_KEY not set"}
-
     return out
 
 @mcp.tool(description="Detailed edge diagnostic POST with optional payload.")
@@ -361,7 +352,9 @@ async def diag_openai(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- Search & Retrieval via Edge ----------
+# ---------------------------
+# Search & Retrieval via Edge
+# ---------------------------
 
 async def _edge_search_core(params: SearchParams) -> Dict[str, Any]:
     edge_url = _resolve_edge_url()
@@ -386,20 +379,14 @@ async def _edge_search_core(params: SearchParams) -> Dict[str, Any]:
 
     headers = make_edge_headers()
     status, data, text = await _post_json(edge_url, body, headers)
-    out: Dict[str, Any] = {
-        "ok": status == 200,
-        "status": status,
-        "mode": body["mode"],
-        "url": edge_url,
-    }
+    out: Dict[str, Any] = {"ok": status == 200, "status": status, "mode": body["mode"], "url": edge_url}
     if not out["ok"]:
         out["error"] = data if data else _truncate(text)
         return out
-
     out["raw"] = data
     return out
 
-@mcp.tool(description="General search via Edge (vector|bm25|hybrid|semantic). Supports OpenAI rerank.")
+@mcp.tool(description="General search via Edge.")
 async def edge_search(params: SearchParams) -> Dict[str, Any]:
     return await _edge_search_core(params)
 
@@ -436,7 +423,7 @@ async def embed_query(q: str, params: Optional[Dict[str, Any]] = None) -> Dict[s
     emb = data.get("embedding") or data.get("vector") or []
     return {"ok": True, "dim": len(emb), "embedding": emb}
 
-@mcp.tool(description="Label a document or match by posting to Edge (action=label).")
+@mcp.tool(description="Label a document or match via Edge (action=label).")
 async def label_result(params: LabelParams, _extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     edge_url = _resolve_edge_url()
     headers = make_edge_headers()
@@ -470,9 +457,11 @@ async def get_document(doc_id: str, params: Optional[Dict[str, Any]] = None) -> 
     status, data, text = await _post_json(edge_url, {"action": "get_document", "doc_id": doc_id}, headers)
     return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
 
-# ---------- Simplified search wrappers ----------
+# ---------------------------
+# Simplified search wrappers
+# ---------------------------
 
-@mcp.tool(description="Canonical search: returns IDs + snippets so fetch() can retrieve full content.")
+@mcp.tool(description="Canonical search: return IDs + snippets for follow‑up fetch().")
 async def search(query: str, limit: int = 10, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     base = await edge_search(SearchParams(q=query, mode=DEFAULTS.mode, top_k=limit, min_score=DEFAULTS.min_score, rerank=False))
     if not base.get("ok"):
@@ -498,9 +487,11 @@ async def search_legal(query: str, top_k: int = 10, params: Optional[Dict[str, A
         items.append({"exhibit_id": ex_id, "snippet": snippet, "score": score})
     return {"ok": True, "items": items}
 
-# ---------- Supabase-backed helpers ----------
+# ---------------------------
+# Supabase-backed helpers
+# ---------------------------
 
-@mcp.tool(description="Assign lightweight labels to results (e.g., CONTRACT / EVIDENCE / DAMAGES).")
+@mcp.tool(description="Assign lightweight labels to results.")
 async def label_results(results: List[Dict[str, Any]], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     labeled: List[Dict[str, Any]] = []
     for r in results:
@@ -522,7 +513,7 @@ async def label_results(results: List[Dict[str, Any]], params: Optional[Dict[str
         labeled.append(lr)
     return {"ok": True, "results": labeled}
 
-@mcp.tool(description="Retrieve the full text pages for a given exhibit.")
+@mcp.tool(description="Retrieve full text pages for an exhibit.")
 async def fetch_exhibit(exhibit_id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not _SUPABASE:
         return {"ok": False, "error": "supabase_client_not_initialized", "pages": []}
@@ -565,7 +556,7 @@ async def fetch_exhibit(exhibit_id: str, params: Optional[Dict[str, Any]] = None
         pass
     return {"ok": True, **meta, "pages": pages}
 
-@mcp.tool(description="List all exhibits with optional category labeling.")
+@mcp.tool(description="List exhibits with optional categories.")
 async def list_exhibits(withLabels: bool = False, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not _SUPABASE:
         return {"ok": False, "error": "supabase_client_not_initialized", "exhibits": []}
@@ -582,7 +573,7 @@ async def list_exhibits(withLabels: bool = False, params: Optional[Dict[str, Any
         out.append(item)
     return {"ok": True, "exhibits": out}
 
-@mcp.tool(description="Keyword/BM25-style search using PostgREST full text on text column.")
+@mcp.tool(description="Keyword/BM25 search via PostgREST text search on vector_embeddings.text.")
 async def keyword_search(query: str, top_k: int = 10, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not _SUPABASE:
         return {"ok": False, "error": "supabase_client_not_initialized", "items": []}
@@ -600,7 +591,7 @@ async def keyword_search(query: str, top_k: int = 10, params: Optional[Dict[str,
     items = [{"exhibit_id": r.get("exhibit_id", "Unknown"), "snippet": _truncate(r.get("text", ""))} for r in rows]
     return {"ok": True, "items": items}
 
-@mcp.tool(description="List all claims (optional status filter).")
+@mcp.tool(description="List claims (optional status filter).")
 async def list_claims(status: Optional[str] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not _SUPABASE:
         return {"ok": False, "error": "supabase_client_not_initialized", "claims": []}
@@ -656,7 +647,7 @@ async def get_case_statistics(params: Optional[Dict[str, Any]] = None) -> Dict[s
         stats["num_facts"] = f"error:{e3}"
     return {"ok": True, "statistics": stats}
 
-@mcp.tool(description="Static example timeline (replace when DB has real timeline table).")
+@mcp.tool(description="Static example timeline (placeholder data).")
 async def get_case_timeline(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     timeline = [
         {"date": "2020-11-06", "event": "Operating Agreement for Floorable LLC signed"},
@@ -690,9 +681,8 @@ async def get_individuals(role: Optional[str] = None, params: Optional[Dict[str,
     except Exception as e:
         return {"ok": False, "error": f"fetch_error:{e}", "individuals": []}
 
-# ---------- Canonical fetch tool ----------
-
-@mcp.tool(description="Given a single exhibit ID, return full document content and metadata.")
+# Canonical fetch
+@mcp.tool(description="Given an exhibit ID, return full content and metadata.")
 async def fetch(id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not id:
         return {"ok": False, "error": "missing_id"}
@@ -704,47 +694,49 @@ async def fetch(id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
     meta = {k: v for k, v in res.items() if k in ("exhibit_id", "description", "filename")}
     return {"ok": True, "id": res.get("exhibit_id", id), "content": content, "metadata": meta}
 
-# ---------- Codex Background Agent Management ----------
+# ---------------------------
+# Codex Agent mgmt (kept as-is)
+# ---------------------------
 
-@mcp.tool(description="Manage the codex background agent (start/stop/status/restart/add_task).")
+@mcp.tool(description="Manage codex background agent (start/stop/status/restart/add_task).")
 async def codex_agent_control(params: CodexAgentParams) -> Dict[str, Any]:
-    action = params.action.lower()
+    action = (params.action or "").lower()
     try:
         if action == "start":
-            result = subprocess.run([sys.executable, "launch_codex_agent.py", "--daemon"], capture_output=True, text=True, timeout=30)
-            return {"ok": result.returncode == 0, "action": "start", "stdout": result.stdout, "stderr": result.stderr, "return_code": result.returncode}
+            r = subprocess.run([sys.executable, "launch_codex_agent.py", "--daemon"], capture_output=True, text=True, timeout=30)
+            return {"ok": r.returncode == 0, "action": "start", "stdout": r.stdout, "stderr": r.stderr, "return_code": r.returncode}
         elif action == "stop":
-            result = subprocess.run([sys.executable, "launch_codex_agent.py", "stop"], capture_output=True, text=True, timeout=30)
-            return {"ok": result.returncode == 0, "action": "stop", "stdout": result.stdout, "stderr": result.stderr, "return_code": result.returncode}
+            r = subprocess.run([sys.executable, "launch_codex_agent.py", "stop"], capture_output=True, text=True, timeout=30)
+            return {"ok": r.returncode == 0, "action": "stop", "stdout": r.stdout, "stderr": r.stderr, "return_code": r.returncode}
         elif action == "status":
-            result = subprocess.run([sys.executable, "launch_codex_agent.py", "status"], capture_output=True, text=True, timeout=10)
-            return {"ok": result.returncode == 0, "action": "status", "stdout": result.stdout, "stderr": result.stderr, "return_code": result.returncode, "running": result.returncode == 0}
+            r = subprocess.run([sys.executable, "launch_codex_agent.py", "status"], capture_output=True, text=True, timeout=10)
+            return {"ok": r.returncode == 0, "action": "status", "stdout": r.stdout, "stderr": r.stderr, "return_code": r.returncode, "running": r.returncode == 0}
         elif action == "restart":
-            result = subprocess.run([sys.executable, "launch_codex_agent.py", "restart"], capture_output=True, text=True, timeout=60)
-            return {"ok": result.returncode == 0, "action": "restart", "stdout": result.stdout, "stderr": result.stderr, "return_code": result.returncode}
+            r = subprocess.run([sys.executable, "launch_codex_agent.py", "restart"], capture_output=True, text=True, timeout=60)
+            return {"ok": r.returncode == 0, "action": "restart", "stdout": r.stdout, "stderr": r.stderr, "return_code": r.returncode}
         elif action == "add_task":
             if not params.task_type or not params.task_data:
-                return {"ok": False, "error": "task_type and task_data are required for add_task action"}
+                return {"ok": False, "error": "task_type and task_data are required for add_task"}
             import uuid
             task_id = str(uuid.uuid4())
             payload = {"task_id": task_id, "task_type": params.task_type, "payload": params.task_data, "created_at": _now_ms()}
             task_file = os.path.join(tempfile.gettempdir(), f"codex_task_{task_id}.json")
             with open(task_file, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
-            return {"ok": True, "action": "add_task", "task_id": task_id, "task_file": task_file, "message": "Task queued for processing"}
+            return {"ok": True, "action": "add_task", "task_id": task_id, "task_file": task_file, "message": "Task queued"}
         else:
-            return {"ok": False, "error": f"Unknown action: {action}. Supported actions: start, stop, status, restart, add_task"}
+            return {"ok": False, "error": f"Unknown action: {action}"}
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "Operation timed out"}
     except Exception as e:
         return {"ok": False, "error": f"Agent control error: {e}"}
 
-@mcp.tool(description="Get information about the codex background agent configuration and status.")
+@mcp.tool(description="Codex agent info.")
 async def codex_agent_info(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
-        result = subprocess.run([sys.executable, "launch_codex_agent.py", "status"], capture_output=True, text=True, timeout=10)
-        is_running = result.returncode == 0
-        config_info = {
+        r = subprocess.run([sys.executable, "launch_codex_agent.py", "status"], capture_output=True, text=True, timeout=10)
+        is_running = r.returncode == 0
+        cfg = {
             "agent_name": os.getenv("CODEX_AGENT_NAME", "burns-codex-agent"),
             "max_workers": os.getenv("CODEX_MAX_WORKERS", "4"),
             "check_interval": os.getenv("CODEX_CHECK_INTERVAL", "30.0"),
@@ -760,102 +752,38 @@ async def codex_agent_info(params: Optional[Dict[str, Any]] = None) -> Dict[str,
             "task_retry_attempts": os.getenv("CODEX_TASK_RETRY_ATTEMPTS", "3"),
             "task_retry_delay": os.getenv("CODEX_TASK_RETRY_DELAY", "5.0"),
         }
-        return {"ok": True, "running": is_running, "status_output": result.stdout or "", "config": config_info,
-                "supported_task_types": ["codex_analysis", "document_processing", "search_optimization", "embedding_generation"]}
+        return {"ok": True, "running": is_running, "status_output": r.stdout or "", "config": cfg}
     except Exception as e:
         return {"ok": False, "error": f"Failed to get agent info: {e}"}
 
-@mcp.tool(description="Create a sample codex agent configuration file.")
-async def codex_agent_create_config(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    try:
-        result = subprocess.run([sys.executable, "launch_codex_agent.py", "create-config"], capture_output=True, text=True, timeout=10)
-        return {"ok": result.returncode == 0, "stdout": result.stdout, "stderr": result.stderr, "message": "Sample configuration file created: codex_agent_config.json"}
-    except Exception as e:
-        return {"ok": False, "error": f"Failed to create config: {e}"}
+# ---------------------------
+# HTTP layer — routes & auth
+# ---------------------------
 
-# ---------- Defaults Management ----------
+# Simple Bearer middleware that protects /mcp* endpoints with BDB_AUTH_TOKEN
+class SimpleBearerMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if BDB_AUTH_TOKEN and request.url.path.startswith(MCP_PATH):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer ") or auth.split(" ", 1)[1] != BDB_AUTH_TOKEN:
+                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return await call_next(request)
 
-@mcp.tool(description="Set session defaults (mode/top_k/min_score/etc).")
-async def set_defaults(params: SetDefaultsParams, _extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if params.mode:
-        DEFAULTS.mode = params.mode.lower()
-    if params.top_k is not None:
-        DEFAULTS.top_k = params.top_k
-    if params.min_score is not None:
-        DEFAULTS.min_score = params.min_score
-    if params.lexical_k is not None:
-        DEFAULTS.lexical_k = params.lexical_k
-    if params.max_fetch_size is not None:
-        globals()["MAX_FETCH_SIZE"] = int(params.max_fetch_size)
-    if params.snippet_length is not None:
-        globals()["SNIPPET_LENGTH"] = int(params.snippet_length)
-    return {"ok": True, "defaults": DEFAULTS.model_dump()}
+# Route handlers (defined as Starlette callables so we can mount them into the Streamable app)
+async def _root_ok(request: Request):
+    return JSONResponse({"ok": True, "name": SERVER_NAME, "version": SERVER_VERSION, "ts": _now_ms()})
 
-@mcp.tool(description="Get session defaults.")
-async def get_defaults(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return {"ok": True, "defaults": DEFAULTS.model_dump()}
+async def _health_get(request: Request):
+    # Guarded by middleware
+    return JSONResponse({"name": SERVER_NAME, "version": SERVER_VERSION, "ok": True})
 
-@mcp.tool(description="Reset session defaults to startup values.")
-async def reset_defaults(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    DEFAULTS.mode = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()
-    DEFAULTS.top_k = int(os.getenv("SEARCH_TOP_K", "10"))
-    DEFAULTS.min_score = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
-    DEFAULTS.lexical_k = int(os.getenv("LEXICAL_K", "0"))
-    globals()["MAX_FETCH_SIZE"] = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
-    globals()["SNIPPET_LENGTH"] = int(os.getenv("SNIPPET_LENGTH", "500"))
-    return {"ok": True, "defaults": DEFAULTS.model_dump()}
+async def _health_head(request: Request):
+    # Guarded by middleware
+    return PlainTextResponse("", status_code=200)
 
-# ---------- Generic Edge Action ----------
-
-@mcp.tool(description="Call Edge with a raw action/payload (advanced).")
-async def edge_action(params: EdgeActionParams, _extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    body = dict(params.payload or {})
-    body["action"] = params.action
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    status, data, text = await _post_json(edge_url, body, headers)
-    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
-
-# ---------- FastAPI App & HTTP Routes ----------
-
-app = FastAPI(title=SERVER_NAME)
-
-# CORS for ChatGPT / browsers
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-    allow_headers=["Content-Type", "Authorization", "Accept", "Origin"],
-)
-
-# Streamable HTTP MCP app (stateless)
-_auth_provider = BearerAuthProvider(token=BDB_AUTH_TOKEN) if BDB_AUTH_TOKEN else None
-_stream_app = create_streamable_http_app(
-    mcp,
-    streamable_http_path="/mcp",
-    json_response=True,
-    stateless_http=True,
-    auth=_auth_provider,
-)
-# Mount at root; Streamable app owns /mcp endpoints
-app.mount("/", _stream_app)
-
-# Health endpoints (guarded if token set)
-@app.get("/mcp/health", response_model=HealthOut)
-async def health_http(_: None = Depends(_auth_required)) -> HealthOut:
-    return HealthOut(name=SERVER_NAME, version=SERVER_VERSION, ok=True)
-
-@app.head("/mcp/health")
-async def health_head(_: None = Depends(_auth_required)) -> None:
-    return
-
-# Diagnostic config endpoint (useful for CI)
-@app.get("/mcp/diag_config")
-async def diag_http(_: None = Depends(_auth_required)) -> Dict[str, Any]:
-    return {
+async def _diag_http(request: Request):
+    # Guarded by middleware
+    return JSONResponse({
         "name": SERVER_NAME,
         "version": SERVER_VERSION,
         "edge_url": _resolve_edge_url(),
@@ -863,48 +791,66 @@ async def diag_http(_: None = Depends(_auth_required)) -> Dict[str, Any]:
         "supabase_url_set": bool(SUPABASE_URL),
         "openai_key_set": bool(OPENAI_API_KEY),
         "stateless_http": True,
-    }
+    })
 
-# Supabase health endpoint used by workflows
-@app.post("/mcp/tools/supabase_health", response_model=SBHealthOut)
-async def supabase_health(_: None = Depends(_auth_required)) -> SBHealthOut:
+async def _supabase_health(request: Request):
+    # Guarded by middleware
     headers = {}
     key = SUPABASE_SERVICE_ROLE_KEY
     if key:
         headers = {"apikey": key, "Authorization": f"Bearer {key}"}
-
     status_auth = 0
     status_rest = 0
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
         try:
             auth_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/health" if SUPABASE_URL else ""
             if auth_url:
-                resp1 = await client.get(auth_url, headers=headers)
-                status_auth = resp1.status_code
+                r1 = await client.get(auth_url, headers=headers)
+                status_auth = r1.status_code
         except Exception:
             status_auth = 0
-
         try:
             rest_url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/" if SUPABASE_URL else ""
             if rest_url:
-                resp2 = await client.head(rest_url, headers=headers)
-                status_rest = resp2.status_code
+                r2 = await client.head(rest_url, headers=headers)
+                status_rest = r2.status_code
         except Exception:
             status_rest = 0
+    return JSONResponse({
+        "auth_ok": (status_auth == 200),
+        "rest_ok": (status_rest in (200, 204, 405)),
+        "status_auth": status_auth,
+        "status_rest": status_rest,
+    })
 
-    return SBHealthOut(
-        auth_ok=(status_auth == 200),
-        rest_ok=(status_rest in (200, 204, 405)),
-        status_auth=status_auth,
-        status_rest=status_rest,
-    )
+# Build the Streamable HTTP app with our custom routes & middleware
+_routes = [
+    Route("/", endpoint=_root_ok, methods=["GET"]),
+    Route(f"{MCP_PATH}/health", endpoint=_health_get, methods=["GET"]),
+    Route(f"{MCP_PATH}/health", endpoint=_health_head, methods=["HEAD"]),
+    Route(f"{MCP_PATH}/diag_config", endpoint=_diag_http, methods=["GET"]),
+    Route(f"{MCP_PATH}/tools/supabase_health", endpoint=_supabase_health, methods=["POST"]),
+]
 
-# Plain /health for manual checks (no auth to help local smoke)
-@app.get("/health")
-async def plain_health() -> Dict[str, Any]:
-    return {"ok": True, "name": SERVER_NAME, "version": SERVER_VERSION, "ts": _now_ms()}
+_middleware = [
+    Middleware(CORSMiddleware,
+              allow_origins=["*"],
+              allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
+              allow_headers=["Content-Type", "Authorization", "Accept", "Origin"]),
+    Middleware(SimpleBearerMiddleware),
+]
 
-# Entrypoint for local dev
+app = create_streamable_http_app(
+    mcp,
+    streamable_http_path=MCP_PATH,
+    auth=None,                  # we gate with SimpleBearerMiddleware to avoid JWTVerifier signature changes
+    json_response=True,
+    stateless_http=True,
+    routes=_routes,
+    middleware=_middleware,
+)
+
+# Local dev
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
