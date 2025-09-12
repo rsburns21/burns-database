@@ -17,14 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Set environment variables (with defaults if not provided)
     env:
-      # App identity & defaults specific to burns-database
       APP_NAME: ${{ vars.APP_NAME || 'burns-database' }}
       PORT: ${{ vars.PORT || '8080' }}
       ENABLE_DIAG: ${{ vars.ENABLE_DIAG || 'true' }}
       BASE_URL: ${{ vars.BASE_URL || 'https://burns-database.fastmcp.app' }}
 
-      # Required secrets/vars
+      # Secrets and other config
       BDB_AUTH_TOKEN: ${{ secrets.BDB_AUTH_TOKEN }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -34,32 +34,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install FastMCP Cloud CLI and jq
+      - name: Install FastMCP Cloud CLI and Dependencies
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
+          # Install the FastMCP Cloud CLI (`fastcloud` command)
           pip install fastmcp-cloud
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y jq
-          fi
-          fastcloud --version || true
-          jq --version || true
+          # Ensure the CLI is available
+          command -v fastcloud || { echo "FastMCP Cloud CLI (fastcloud) not found in PATH"; exit 1; }
+          # Install jq for JSON parsing in later steps
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
       - name: Deploy to FastMCP Cloud
         shell: bash
         run: |
           set -euo pipefail
-          APP_NAME_FIXED="${APP_NAME:-burns-database}"
+          # Use the FastMCP Cloud CLI to deploy
+          APP_NAME_FIXED="${APP_NAME:-burnsdb}"
           PORT_FIXED="${PORT:-8080}"
 
-          echo "Deploying '${APP_NAME_FIXED}' on port ${PORT_FIXED}…"
           fastcloud deploy \
             --app "${APP_NAME_FIXED}" \
             --start "uvicorn server:app --host 0.0.0.0 --port ${PORT_FIXED}" \
@@ -77,39 +77,42 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          fastcloud healthcheck set --app "${APP_NAME:-burns-database}" --path "/mcp" || true
+          # Configure the healthcheck endpoint for the FastMCP app
+          fastcloud healthcheck set --app "${APP_NAME:-burnsdb}" --path "/mcp" || true
 
-      - name: Verify /mcp/health (post-deploy)
+      - name: Verify /mcp/health endpoint
         shell: bash
         run: |
           set -euo pipefail
-          echo "Waiting for ${BASE_URL}/mcp/health to return 200…"
+          # Try up to 5 times to get a 200 OK from the health endpoint
           code="000"
-          for i in {1..5}; do
+          for attempt in {1..5}; do
             code=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
               "${BASE_URL}/mcp/health" || true)
             if [ "$code" = "200" ]; then
-              echo "Health OK"
+              echo "Health check OK (received HTTP 200)."
               break
             fi
-            echo "Health not ready (got $code); retrying in 5s…"
+            echo "Health not ready (got $code). Retrying in 5 seconds..."
             sleep 5
           done
           if [ "$code" != "200" ]; then
-            echo "❌ Health check failed with $code"
+            echo "Health check failed (last HTTP code $code)."
             exit 1
           fi
 
-      - name: Verify Supabase connectivity via server tool
+      - name: Verify Supabase connectivity
         shell: bash
         run: |
           set -euo pipefail
-          echo "Checking Supabase connectivity at ${BASE_URL}/mcp/tools/supabase_health…"
-          result="$(curl -sS -X POST \
+          # Call the /mcp/tools/supabase_health endpoint to check Supabase connections
+          response=$(curl -sS -X POST \
             -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
             -H "Content-Type: application/json" \
-            "${BASE_URL}/mcp/tools/supabase_health")"
-          echo "Response: $result"
-          echo "$result" | jq -e '.auth_ok and .rest_ok' >/dev/null
-          echo "✅ Supabase check passed: auth_ok=$(echo "$result" | jq -r .auth_ok), rest_ok=$(echo "$result" | jq -r .rest_ok)"
+            "${BASE_URL}/mcp/tools/supabase_health")
+          echo "Supabase health response: $response"
+
+          # Use jq to assert that auth_ok and rest_ok are true in the JSON response
+          echo "$response" | jq -e '.auth_ok and .rest_ok' > /dev/null
+          echo "Supabase connectivity: auth_ok = $(echo "$response" | jq -r '.auth_ok'), rest_ok = $(echo "$response" | jq -r '.rest_ok')"
