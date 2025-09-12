@@ -1,7 +1,7 @@
 # server.py
-# Burns Database MCP Server — FastMCP Streamable HTTP (stateless) + Supabase
-# Fixes: remove deprecated BearerAuthProvider, add middleware-based Bearer auth
-# Version: 4.4.2
+# Burns Database MCP Server — FastMCP Streamable HTTP (stateless) + Supabase/Edge tools
+# Auth is handled by FastCloud at the edge (OAuth). No in-app bearer middleware.
+# Version: 4.5.0
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, Field
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
@@ -30,15 +31,10 @@ from fastmcp.server.http import create_streamable_http_app
 # ---------------------------
 
 SERVER_NAME = os.getenv("APP_NAME", "burns-database").strip()
-SERVER_VERSION = os.getenv("APP_VERSION", "4.4.2").strip()
-
-# Streamable MCP path
+SERVER_VERSION = os.getenv("APP_VERSION", "4.5.0").strip()
 MCP_PATH = "/mcp"
 
-# Secured readiness/CI token
-BDB_AUTH_TOKEN = os.getenv("BDB_AUTH_TOKEN", "").strip()
-
-# Supabase + Edge Function
+# Supabase & Edge
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = (
     os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -46,15 +42,16 @@ SUPABASE_SERVICE_ROLE_KEY = (
     or ""
 )
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()  # optional catch-all
+
 EDGEFN_URL = os.getenv(
     "EDGEFN_URL",
     "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search",
 ).strip()
 
-# OpenAI (only for diagnostics/rerank ping)
+# Optional OpenAI (used only for diagnostics/rerank ping)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# Outbound allowlist
+# Allowlist for outbound calls
 ALLOWLIST_DEFAULT = [
     "nqkzqcsqfvpquticvwmk.supabase.co",
     "nqkzqcsqfvpquticvwmk.functions.supabase.co",
@@ -179,7 +176,7 @@ class Defaults(BaseModel):
 DEFAULTS = Defaults()
 
 # ---------------------------
-# FastMCP server (stateless)
+# FastMCP server (stateless HTTP)
 # ---------------------------
 
 mcp = FastMCP(name=SERVER_NAME, instructions=f"{SERVER_NAME} MCP server")
@@ -226,7 +223,7 @@ class CodexAgentParams(BaseModel):
     config_override: Optional[Dict[str, Any]] = None
 
 # ---------------------------
-# Tools — Utility / Diag
+# Utility / Diagnostics tools
 # ---------------------------
 
 @mcp.tool(description="Echo text back.")
@@ -646,7 +643,7 @@ async def get_case_statistics(params: Optional[Dict[str, Any]] = None) -> Dict[s
         stats["num_facts"] = f"error:{e3}"
     return {"ok": True, "statistics": stats}
 
-@mcp.tool(description="Static example timeline (placeholder data).")
+@mcp.tool(description="Static example timeline.")
 async def get_case_timeline(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     timeline = [
         {"date": "2020-11-06", "event": "Operating Agreement for Floorable LLC signed"},
@@ -694,7 +691,7 @@ async def fetch(id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, A
     return {"ok": True, "id": res.get("exhibit_id", id), "content": content, "metadata": meta}
 
 # ---------------------------
-# Codex Agent mgmt (kept as-is)
+# Codex Agent mgmt (kept)
 # ---------------------------
 
 @mcp.tool(description="Manage codex background agent (start/stop/status/restart/add_task).")
@@ -755,33 +752,79 @@ async def codex_agent_info(params: Optional[Dict[str, Any]] = None) -> Dict[str,
     except Exception as e:
         return {"ok": False, "error": f"Failed to get agent info: {e}"}
 
+@mcp.tool(description="Create a sample codex agent configuration file.")
+async def codex_agent_create_config(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    try:
+        r = subprocess.run([sys.executable, "launch_codex_agent.py", "create-config"], capture_output=True, text=True, timeout=10)
+        return {"ok": r.returncode == 0, "stdout": r.stdout, "stderr": r.stderr, "message": "Sample configuration file created: codex_agent_config.json"}
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to create config: {e}"}
+
 # ---------------------------
-# HTTP layer — routes & auth
+# Defaults mgmt
 # ---------------------------
 
-# Simple Bearer middleware that protects /mcp* endpoints with BDB_AUTH_TOKEN
-class SimpleBearerMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if BDB_AUTH_TOKEN and request.url.path.startswith(MCP_PATH):
-            auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer ") or auth.split(" ", 1)[1] != BDB_AUTH_TOKEN:
-                return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-        return await call_next(request)
+@mcp.tool(description="Set session defaults (mode/top_k/min_score/etc).")
+async def set_defaults(params: SetDefaultsParams, _extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if params.mode:
+        DEFAULTS.mode = params.mode.lower()
+    if params.top_k is not None:
+        DEFAULTS.top_k = params.top_k
+    if params.min_score is not None:
+        DEFAULTS.min_score = params.min_score
+    if params.lexical_k is not None:
+        DEFAULTS.lexical_k = params.lexical_k
+    if params.max_fetch_size is not None:
+        globals()["MAX_FETCH_SIZE"] = int(params.max_fetch_size)
+    if params.snippet_length is not None:
+        globals()["SNIPPET_LENGTH"] = int(params.snippet_length)
+    return {"ok": True, "defaults": DEFAULTS.model_dump()}
 
-# Route handlers (defined as Starlette callables so we can mount them into the Streamable app)
+@mcp.tool(description="Get session defaults.")
+async def get_defaults(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {"ok": True, "defaults": DEFAULTS.model_dump()}
+
+@mcp.tool(description="Reset session defaults to startup values.")
+async def reset_defaults(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    DEFAULTS.mode = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()
+    DEFAULTS.top_k = int(os.getenv("SEARCH_TOP_K", "10"))
+    DEFAULTS.min_score = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
+    DEFAULTS.lexical_k = int(os.getenv("LEXICAL_K", "0"))
+    globals()["MAX_FETCH_SIZE"] = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
+    globals()["SNIPPET_LENGTH"] = int(os.getenv("SNIPPET_LENGTH", "500"))
+    return {"ok": True, "defaults": DEFAULTS.model_dump()}
+
+# ---------------------------
+# Edge raw action
+# ---------------------------
+
+@mcp.tool(description="Call Edge with a raw action/payload (advanced).")
+async def edge_action(params: EdgeActionParams, _extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    edge_url = _resolve_edge_url()
+    headers = make_edge_headers()
+    body = dict(params.payload or {})
+    body["action"] = params.action
+    ok, host = _is_host_allowlisted(edge_url)
+    if not ok:
+        return {"ok": False, "error": f"host '{host}' not in allowlist"}
+    status, data, text = await _post_json(edge_url, body, headers)
+    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
+
+# ---------------------------
+# HTTP routes (for CI & quick checks)
+# ---------------------------
+
 async def _root_ok(request: Request):
     return JSONResponse({"ok": True, "name": SERVER_NAME, "version": SERVER_VERSION, "ts": _now_ms()})
 
 async def _health_get(request: Request):
-    # Guarded by middleware
+    # No in-app auth; FastCloud may gate this route if deployment is private
     return JSONResponse({"name": SERVER_NAME, "version": SERVER_VERSION, "ok": True})
 
 async def _health_head(request: Request):
-    # Guarded by middleware
     return PlainTextResponse("", status_code=200)
 
 async def _diag_http(request: Request):
-    # Guarded by middleware
     return JSONResponse({
         "name": SERVER_NAME,
         "version": SERVER_VERSION,
@@ -793,7 +836,6 @@ async def _diag_http(request: Request):
     })
 
 async def _supabase_health(request: Request):
-    # Guarded by middleware
     headers = {}
     key = SUPABASE_SERVICE_ROLE_KEY
     if key:
@@ -817,12 +859,11 @@ async def _supabase_health(request: Request):
             status_rest = 0
     return JSONResponse({
         "auth_ok": (status_auth == 200),
-        "rest_ok": (status_rest in (200, 204, 405)),
+        "rest_ok": (status_rest in (200, 204, 405, 404)),
         "status_auth": status_auth,
         "status_rest": status_rest,
     })
 
-# Build the Streamable HTTP app with our custom routes & middleware
 _routes = [
     Route("/", endpoint=_root_ok, methods=["GET"]),
     Route(f"{MCP_PATH}/health", endpoint=_health_get, methods=["GET"]),
@@ -836,13 +877,14 @@ _middleware = [
                allow_origins=["*"],
                allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
                allow_headers=["Content-Type", "Authorization", "Accept", "Origin"]),
-    # NOTE: no SimpleBearerMiddleware; FastCloud handles OAuth at the edge
+    # No bearer middleware; FastCloud handles OAuth
 ]
 
+# Build the Streamable HTTP app
 app = create_streamable_http_app(
     mcp,
     streamable_http_path=MCP_PATH,
-    auth=None,              # ⬅️ let FastCloud own authentication
+    auth=None,              # Let FastCloud own authentication/OAuth
     json_response=True,
     stateless_http=True,
     routes=_routes,
