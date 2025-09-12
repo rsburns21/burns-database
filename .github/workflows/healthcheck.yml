@@ -2,47 +2,40 @@ name: FastCloud Health Check
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: "*/15 * * * *"
   workflow_dispatch:
-    inputs:
-      base_url:
-        description: 'Base URL of the deployment'
-        required: false
-        default: 'https://burnsdb.fastmcp.app'
+
+permissions:
+  contents: read
 
 jobs:
-  health-check:
+  health:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      BASE_URL: ${{ vars.BASE_URL || 'https://burns-database.fastmcp.app' }}
+      BDB_AUTH_TOKEN: ${{ secrets.BDB_AUTH_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install aiohttp
-        run: pip install aiohttp
-      - name: Run health check
-        env:
-          BASE_URL: ${{ github.event.inputs.base_url || 'https://burnsdb.fastmcp.app' }}
-          MCP_API_KEY: ${{ secrets.MCP_API_KEY }}
+      - name: Check MCP /health
         run: |
-          python - << 'PY'
-          import os, sys, asyncio, aiohttp
-          base = os.environ.get('BASE_URL','https://burnsdb.fastmcp.app').rstrip('/')
-          async def main():
-              async with aiohttp.ClientSession() as s:
-                  # Try initialize
-                  url = base + '/mcp'
-                  payload = {"jsonrpc":"2.0","id":"1","method":"initialize","params":{"clientInfo":{"name":"health","version":"0"}}}
-                  headers={'Content-Type':'application/json'}
-                  api = os.environ.get('MCP_API_KEY')
-                  if api:
-                      headers['Authorization'] = f'Bearer {api}'
-                  async with s.post(url,json=payload,headers=headers) as r:
-                      ok = r.status==200
-                      txt = await r.text()
-                      print('Status:', r.status)
-                      print('Body:', txt[:500])
-                      sys.exit(0 if ok else 1)
-          asyncio.run(main())
+          set -e
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
+            "${BASE_URL}/mcp/health" || true)
+          if [ "$code" != "200" ]; then
+            echo "MCP /health returned $code"; exit 1; fi
+
+      - name: Check Supabase health via tool
+        run: |
+          set -e
+          result=$(curl -sS -X POST \
+            -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${BASE_URL}/mcp/tools/supabase_health")
+          python - <<'PY'
+          import json, sys
+          d=json.loads("""$result""")
+          print(d)
+          # Warn on missing keys; do not hard-fail Supabase state in a monitoring check
+          assert "auth_ok" in d and "rest_ok" in d, "Missing keys in supabase_health output"
           PY
