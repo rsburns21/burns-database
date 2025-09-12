@@ -35,14 +35,9 @@ features:
   progress: true
 
 security:
-  auth_mode: none  # set to bearer in production
+  auth_mode: bearer
   cors:
     enabled: true
-    allowed_origins:
-      - "*"
-    allowed_headers:
-      - "Content-Type"
-      - "Authorization"
-      - "Accept"
-      - "Origin"
-    allowed_methods: ["GET", "POST", "OPTIONS"]
+    allowed_origins: ["*"]
+    allowed_headers: ["Content-Type","Authorization","Accept","Origin"]
+    allowed_methods: ["GET","POST","OPTIONS"]
