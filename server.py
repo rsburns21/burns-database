@@ -843,11 +843,17 @@ _middleware = [
 app = create_streamable_http_app(
     mcp,
     streamable_http_path=MCP_PATH,
-    auth=None,                  # we gate with SimpleBearerMiddleware to avoid JWTVerifier signature changes
+    auth="fastmcp",           # <<< let FastCloud own the OAuth handshake
     json_response=True,
     stateless_http=True,
     routes=_routes,
-    middleware=_middleware,
+    middleware=[
+        Middleware(CORSMiddleware,
+                   allow_origins=["*"],
+                   allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
+                   allow_headers=["Content-Type", "Authorization", "Accept", "Origin"]),
+        # DO NOT add SimpleBearerMiddleware here
+    ],
 )
 
 # Local dev
