@@ -28,17 +28,17 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
     steps:
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: Install jq
+      - name: "Install jq"
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Guard: APP_NAME must match BASE_URL subdomain
+      - name: "Guard — APP_NAME must match BASE_URL subdomain"
         shell: bash
         run: |
           set -euo pipefail
@@ -50,7 +50,7 @@ jobs:
             exit 1
           fi
 
-      - name: Wait for FastCloud deployment to go live
+      - name: "Wait for FastCloud deployment to go live"
         shell: bash
         run: |
           set -euo pipefail
@@ -58,8 +58,6 @@ jobs:
             echo "BDB_AUTH_TOKEN is not set"; exit 1
           fi
 
-          # Poll the production health endpoint for up to ~20 minutes
-          # Treat 401 as a hard failure (likely token mismatch)
           max_attempts=60
           attempt=0
           last_code="000"
@@ -68,12 +66,11 @@ jobs:
             last_code=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
               "${BASE_URL}/mcp/health" || true)
-
             if [ "${last_code}" = "200" ]; then
               echo "Health OK (200) after ${attempt} attempts."
               break
             elif [ "${last_code}" = "401" ]; then
-              echo "❌ Health endpoint returned 401 Unauthorized. Check BDB_AUTH_TOKEN in GitHub and FastCloud."
+              echo "Health endpoint returned 401 Unauthorized. Check BDB_AUTH_TOKEN in GitHub and FastCloud."
               exit 1
             else
               echo "Health not ready (got ${last_code}); retrying in 20s... [${attempt}/${max_attempts}]"
@@ -82,11 +79,11 @@ jobs:
           done
 
           if [ "${last_code}" != "200" ]; then
-            echo "❌ Health never reached 200 OK (last ${last_code})."
+            echo "Health never reached 200 OK (last ${last_code})."
             exit 1
           fi
 
-      - name: Supabase connectivity (tool: /mcp/tools/supabase_health)
+      - name: "Supabase connectivity (tool: /mcp/tools/supabase_health)"
         shell: bash
         run: |
           set -euo pipefail
@@ -94,19 +91,17 @@ jobs:
             -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
             -H "Content-Type: application/json" \
             "${BASE_URL}/mcp/tools/supabase_health")" || {
-              echo "❌ Request failed"; exit 1; }
-
+              echo "Request failed"; exit 1; }
           echo "Response: $resp"
 
-          # Ensure JSON and required keys exist
           echo "$resp" | jq -e 'has("auth_ok") and has("rest_ok")' >/dev/null || {
-            echo "❌ Response missing expected keys (auth_ok/rest_ok)"; exit 1; }
+            echo "Response missing expected keys (auth_ok/rest_ok)"; exit 1; }
 
           auth_ok=$(echo "$resp" | jq -r '.auth_ok')
           rest_ok=$(echo "$resp" | jq -r '.rest_ok')
           echo "auth_ok=$auth_ok rest_ok=$rest_ok"
 
-          # Treat false as failure so CI is truthful
           if [ "$auth_ok" != "true" ] || [ "$rest_ok" != "true" ]; then
-            echo "❌ Supabase connectivity check failed"; exit 1
+            echo "Supabase connectivity check failed"
+            exit 1
           fi
