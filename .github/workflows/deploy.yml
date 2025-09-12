@@ -17,14 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # These variables are inherited by all steps
     env:
       APP_NAME: ${{ vars.APP_NAME || 'burns-database' }}
       PORT: ${{ vars.PORT || '8080' }}
       ENABLE_DIAG: ${{ vars.ENABLE_DIAG || 'true' }}
       BASE_URL: ${{ vars.BASE_URL || 'https://burns-database.fastmcp.app' }}
 
-      # Secrets (set these in repo Secrets → Actions)
+      # Secrets / Vars
       BDB_AUTH_TOKEN: ${{ secrets.BDB_AUTH_TOKEN }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -39,30 +38,39 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FastAPI deploy CLI (with fallback)
+      - name: Install dependencies (CLI + jq)
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install fastapi-cloud-cli || true
           if ! command -v fastapi-cloud >/dev/null 2>&1; then
             pip install "fastapi[standard]"
           fi
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
           command -v fastapi-cloud || true
           command -v fastapi || true
+          command -v jq || true
 
       - name: Deploy to FastAPI Cloud
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           if command -v fastapi-cloud >/dev/null 2>&1; then
             CLI="fastapi-cloud"
           elif command -v fastapi >/dev/null 2>&1; then
             CLI="fastapi"
           else
-            echo "Neither fastapi-cloud nor fastapi is available"; exit 127
+            echo "Neither fastapi-cloud nor fastapi is available"
+            exit 127
           fi
 
           PORT_FIXED="${PORT}"
-          $CLI deploy \
+
+          "$CLI" deploy \
             --project "burns-legal/burns-database" \
             --entrypoint "uvicorn server:app --host 0.0.0.0 --port ${PORT_FIXED}" \
             --env APP_NAME="${APP_NAME}" \
@@ -71,28 +79,26 @@ jobs:
             --env BDB_AUTH_TOKEN="${BDB_AUTH_TOKEN}" \
             --env SUPABASE_URL="${SUPABASE_URL}" \
             --env SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SERVICE_ROLE_KEY}" \
-            --env SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY}" \
             --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
             --env EDGEOFN_AUTH_MODE="service_role"
 
       - name: Set healthcheck route (best effort)
         if: always()
+        shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           if command -v fastapi-cloud >/dev/null 2>&1; then
-            fastapi-cloud healthcheck set \
-              --app "${APP_NAME}" \
-              --url "/mcp/health" || true
+            fastapi-cloud healthcheck set --app "${APP_NAME}" --url "/mcp/health" || true
           elif command -v fastapi >/dev/null 2>&1; then
-            fastapi healthcheck set \
-              --app "${APP_NAME}" \
-              --path "/mcp" || true
+            fastapi healthcheck set --app "${APP_NAME}" --path "/mcp" || true
           fi
 
       - name: Verify /mcp/health (post-deploy)
+        shell: bash
         run: |
-          set -euxo pipefail
-          for i in {1..5}; do
+          set -euo pipefail
+          code="000"
+          for i in 1 2 3 4 5; do
             code=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
               "${BASE_URL}/mcp/health" || true)
@@ -103,19 +109,23 @@ jobs:
             echo "Health not ready (got $code), retrying in 5s..."
             sleep 5
           done
-          [ "$code" = "200" ] || (echo "Health check failed with $code"; exit 1)
+          if [ "$code" != "200" ]; then
+            echo "Health check failed with $code"
+            exit 1
+          fi
 
       - name: Verify Supabase connectivity
+        shell: bash
         run: |
-          set -euxo pipefail
-          result=$(curl -sS -X POST \
-          -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
-          -H "Content-Type: application/json" \
-          "${BASE_URL}/mcp/tools/supabase_health")
+          set -euo pipefail
+          result="$(curl -sS -X POST \
+            -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${BASE_URL}/mcp/tools/supabase_health")"
+
           echo "$result"
-          RESULT="$result" python - <<'PY'
-          import os, json
-          d = json.loads(os.environ["RESULT"])
-          assert "auth_ok" in d and "rest_ok" in d, "Missing keys in supabase_health output"
-          print("auth_ok =", d.get("auth_ok"), "rest_ok =", d.get("rest_ok"))
-          PY
+
+          # Validate it's JSON and has the keys we need
+          echo "$result" | jq -e '.auth_ok and .rest_ok' >/dev/null
+
+          echo "auth_ok = $(echo "$result" | jq -r '.auth_ok')  rest_ok = $(echo "$result" | jq -r '.rest_ok')"
