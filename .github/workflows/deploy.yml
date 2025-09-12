@@ -28,9 +28,7 @@ jobs:
       BDB_AUTH_TOKEN: ${{ secrets.BDB_AUTH_TOKEN }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      # Optional: add FASTMCP_API_KEY if your CLI requires it
 
     steps:
       - name: Checkout repository
@@ -111,14 +109,13 @@ jobs:
         run: |
           set -euxo pipefail
           result=$(curl -sS -X POST \
-            -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "${BASE_URL}/mcp/tools/supabase_health")
+          -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
+          -H "Content-Type: application/json" \
+          "${BASE_URL}/mcp/tools/supabase_health")
           echo "$result"
-          python - <<'PY'
-import json, sys
-d=json.loads("""$result""")
-assert "auth_ok" in d and "rest_ok" in d, "Missing keys in supabase_health output"
-# You can choose to fail the job if either is false, but often it's better to log.
-print("auth_ok =", d.get("auth_ok"), "rest_ok =", d.get("rest_ok"))
-PY
+          RESULT="$result" python - <<'PY'
+          import os, json
+          d = json.loads(os.environ["RESULT"])
+          assert "auth_ok" in d and "rest_ok" in d, "Missing keys in supabase_health output"
+          print("auth_ok =", d.get("auth_ok"), "rest_ok =", d.get("rest_ok"))
+          PY
