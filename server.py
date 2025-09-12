@@ -21,7 +21,6 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastmcp import FastMCP
 from fastmcp.server.http import create_streamable_http_app
@@ -834,26 +833,20 @@ _routes = [
 
 _middleware = [
     Middleware(CORSMiddleware,
-              allow_origins=["*"],
-              allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-              allow_headers=["Content-Type", "Authorization", "Accept", "Origin"]),
-    Middleware(SimpleBearerMiddleware),
+               allow_origins=["*"],
+               allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
+               allow_headers=["Content-Type", "Authorization", "Accept", "Origin"]),
+    # NOTE: no SimpleBearerMiddleware; FastCloud handles OAuth at the edge
 ]
 
 app = create_streamable_http_app(
     mcp,
     streamable_http_path=MCP_PATH,
-    auth="fastmcp",           # <<< let FastCloud own the OAuth handshake
+    auth=None,              # ⬅️ let FastCloud own authentication
     json_response=True,
     stateless_http=True,
     routes=_routes,
-    middleware=[
-        Middleware(CORSMiddleware,
-                   allow_origins=["*"],
-                   allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-                   allow_headers=["Content-Type", "Authorization", "Accept", "Origin"]),
-        # DO NOT add SimpleBearerMiddleware here
-    ],
+    middleware=_middleware,
 )
 
 # Local dev
