@@ -47,5 +47,32 @@ Supabase logs (connectivity reference):
 Notes:
 - Server exports `app` (ASGI). Do not self-run in cloud; workflows launch `uvicorn server:app`.
 - Outbound `ALLOWLIST_HOSTS` restricts HTTP calls; configure as needed.
-- Supabase schema uses lowercase columns (e.g. `exhibit_id`).
-- See `docs/enhancement_plan.md` for roadmap.
+
+# Burns-Database MCP Server
+
+This repo hosts the BurnsDB MCP server (FastMCP over HTTP) that proxies a single Supabase Edge Function (`advanced_semantic_search`) for legal discovery search.
+
+- Remote MCP endpoint (after deploy): `https://BurnsDB.fastmcp.app/mcp`
+- Recommended client: `npx -y mcp-remote@0.1.29 https://BurnsDB.fastmcp.app/mcp`
+
+## Quick start (local)
+- `python -m venv .venv && .\.venv\Scripts\Activate.ps1`
+- `pip install -r requirements.txt`
+- `uvicorn server:app --host 0.0.0.0 --port 8080`
+
+## FastCloud deploy
+- **GitHub Variables:** `PORT` (8080), `APP_NAME` (burnsdb)
+- **GitHub Secrets:** `SUPABASE_SERVICE_ROLE_KEY` (required), optionally `OPENAI_API_KEY`
+- Push to `main` to trigger deploy
+
+## Auth policy (important)
+- Service-role only for server↔Supabase. No ANON keys anywhere.
+- The server always includes `Authorization: Bearer <service_role>` and `apikey: <service_role>` when calling Supabase Edge.
+
+## Edge Function ping (prod)
+```bash
+curl -i --location --request POST "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search" \
+  --header "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+  --header "Content-Type: application/json" \
+  --data '{"query":"connectivity smoke test","k":3}'
+

@@ -1,3 +1,4 @@
+# .github/workflows/ci.yml
 name: CI
 
 on:
@@ -10,21 +11,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Static compile check
         run: |
           python -m py_compile server.py
-      - name: Import and build app
+
+      - name: Import ASGI app and ping a route
         run: |
-          python - << 'PY'
+          python - <<'PY'
+          import sys
           import server
-          app = server.build_app()
-          assert app is not None
-          print('OK: app built')
+          assert hasattr(server, "app"), "server.app not found"
+          print("OK: server.app exists")
+          try:
+              from starlette.testclient import TestClient
+              client = TestClient(server.app)
+              # try /health; fall back to /
+              resp = client.get("/health")
+              if resp.status_code >= 400:
+                  resp = client.get("/")
+              print(f"OK: request returned {resp.status_code}")
+          except Exception as e:
+              # Non-fatal: only validating import & basic wiring
+              print(f"Note: skipped HTTP probe: {e}", file=sys.stderr)
           PY

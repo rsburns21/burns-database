@@ -1,3 +1,10 @@
+# Resolved `server.py`
+
+> Strategy: keep the richer **main** implementation (v4.3.0, 30+ tools, strict allowlist, OpenAI rerank) and incorporate the **master** improvements that matter:
+> - Clarified comment about lowercase columns already reflected in code paths
+> - Functions domain is already allowlisted; the default Edge URL remains the canonical `/functions/v1/...` endpoint (works in prod and locally with `supabase start`)
+
+```python
 # server.py
 # BDB — BurnsDB FastMCP server (single-file edition)
 # Version: 4.3.0
@@ -18,7 +25,6 @@ from __future__ import annotations
 import os
 import json
 import time
-import math
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -85,14 +91,14 @@ def _resolve_edge_url() -> str:
 
 def make_edge_headers() -> Dict[str, str]:
     """
-    Always include apikey and Authorization when a key is available.
-    Supports opaque service-role strings (non-JWT) and JWTs alike.
+    Always include apikey + Authorization: Bearer <service_role_key> when key is available.
+    Works with opaque service keys (non-JWT).
     """
     headers: Dict[str, str] = {"Content-Type": "application/json"}
-    # Prefer explicit service role, then SUPABASE_KEY catch-all
-    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
+    key = SUPABASE_SERVICE_ROLE_KEY
     if key:
-        headers.update({"apikey": key, "Authorization": f"Bearer {key}"})
+        headers["apikey"] = key
+        headers["Authorization"] = f"Bearer {key}"
     return headers
 
 def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
@@ -265,7 +271,6 @@ async def health() -> Dict[str, Any]:
     # OpenAI sanity if key available
     if OPENAI_API_KEY:
         try:
-            # Lightweight HEAD to api.openai.com
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
                 r = await client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
                 out["openai"] = {"ok": r.status_code in (200, 401, 403), "status": r.status_code}
@@ -363,62 +368,47 @@ async def _edge_search_core(params: SearchParams) -> Dict[str, Any]:
 
 async def _rerank_openai(query: str, results: List[Dict[str, Any]], top_k: Optional[int] = None) -> List[Dict[str, Any]]:
     """
-    Simple rerank: send query + candidates to OpenAI for scoring using a lightweight model.
-    We keep this simple and deterministic (no streaming). Requires OPENAI_API_KEY.
+    Simple rerank: send query + candidates to OpenAI for scoring.
+    Requires OPENAI_API_KEY.
     """
     # Prepare candidate texts
     cands = []
     for r in results:
-        txt = r.get("text") or r.get("content") or json.dumps(r)  # robust
+        txt = r.get("text") or r.get("content") or json.dumps(r)
         cands.append(txt)
 
-    # Truncate to a reasonable count to keep latency in check
+    # Truncate to a reasonable count
     limit = min(len(cands), top_k or DEFAULTS.top_k)
     cands = cands[:limit]
 
-    # Use responses API with a simple instruction-style scoring
-    # (We avoid fancy tool calls to keep compatibility tight.)
     prompt = (
         "You are a ranking function. Score each candidate passage for relevance to the user query on a 0-100 scale.\n"
-        f"Query: {query}\n\n"
-        "Candidates:\n"
+        f"Query: {query}\n\nCandidates:\n"
+        + "\n".join(f"[{i+1}] {c}" for i, c in enumerate(cands))
+        + "\n\nReturn a JSON array of numbers only (scores aligned with index order)."
     )
-    for i, c in enumerate(cands, 1):
-        prompt += f"[{i}] {c}\n"
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-4o-mini",
-        "input": [
-            {
-                "role": "user",
-                "content": prompt + "\nReturn a JSON array of numbers only (scores aligned with index order).",
-            }
-        ],
-        "temperature": 0,
-    }
+    payload = {"model": "gpt-4o-mini", "input": [{"role": "user", "content": prompt}], "temperature": 0}
+
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
         r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
         j = await r.json()
-        # Very defensive parse: try to read a JSON array from the model's text
         out_text = ""
         try:
-            out_text = j["output"][0]["content"][0]["text"]  # new Responses format
+            out_text = j["output"][0]["content"][0]["text"]
         except Exception:
             try:
-                out_text = j["choices"][0]["message"]["content"]  # legacy compat
+                out_text = j["choices"][0]["message"]["content"]
             except Exception:
                 out_text = ""
-
         try:
             scores = json.loads(out_text)
             if not isinstance(scores, list):
                 raise ValueError("scores not a list")
         except Exception:
-            # fallback: uniform scores if parse fails
             scores = [50] * len(cands)
 
-    # Attach scores and sort
     scored = []
     for idx, r in enumerate(results[:limit]):
         rr = dict(r)
@@ -493,10 +483,6 @@ async def get_document(doc_id: str) -> Dict[str, Any]:
 
 @mcp.tool(description="Reciprocal Rank Fusion of two result sets (client-side).")
 async def combine_results(set_a: List[Dict[str, Any]], set_b: List[Dict[str, Any]], k: int = 60) -> Dict[str, Any]:
-    """
-    RRF fusion: score = sum(1 / (k + rank))
-    Expects each set as list of dicts with a stable 'id' or 'doc_id'.
-    """
     def index_by_id(items: List[Dict[str, Any]]) -> List[str]:
         ids = []
         for it in items:
@@ -514,7 +500,7 @@ async def combine_results(set_a: List[Dict[str, Any]], set_b: List[Dict[str, Any
 
     fused = []
     seen: Dict[str, bool] = {}
-    # Reconstruct minimal rows, preferring set_a’s meta then set_b
+
     def find_row(id_: str) -> Dict[str, Any]:
         for it in set_a:
             if (it.get("id") or it.get("doc_id")) == id_:
@@ -547,9 +533,6 @@ async def rerank_by_openai(query: str, results: List[Dict[str, Any]], top_k: Opt
 
 @mcp.tool(description="BM25-like lightweight rerank (client-side heuristic).")
 async def rerank_by_bm25(query: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Very simple BM25-ish scoring (heuristic). Not a full implementation; useful as a client-side tiebreaker.
-    """
     q_terms = [t for t in query.lower().split() if t]
     def score(txt: str) -> float:
         t = txt.lower()
@@ -569,11 +552,9 @@ async def rerank_hybrid(query: str, results: List[Dict[str, Any]]) -> Dict[str, 
     first = await rerank_by_openai(query, results)
     if not first.get("ok"):
         return first
-    # Apply BM25 heuristic to top 2 ties if scores identical
     ranked = first["results"]
     if len(ranked) >= 2 and ranked[0].get("_rerank") == ranked[1].get("_rerank"):
         tie = await rerank_by_bm25(query, ranked[:2])
-        # Prefer one with higher bm25h
         tie_sorted = tie["results"]
         anchored = tie_sorted + ranked[2:]
         return {"ok": True, "results": anchored}
@@ -634,10 +615,8 @@ async def edge_action(params: EdgeActionParams) -> Dict[str, Any]:
 # ---------------------------
 
 def build_app():
-    # Build a FastAPI app and mount MCP under /mcp; add HTTP /health
     app = FastAPI()
 
-    # HTTP /health endpoint
     @app.get("/health")
     async def health_http():
         edge_url = _resolve_edge_url()
@@ -649,17 +628,4 @@ def build_app():
         return {
             "ok": status == 200,
             "edge": {"url": edge_url, "status": status, "body": data if data else _truncate(text)},
-            "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        }
-
-    # Mount MCP server at /mcp (FastMCP 2.12.x: no path kwarg on http_app)
-    app.mount("/mcp", mcp.http_app())
-    return app
-
-# Exported for platform discovery (FastCloud)
-app = build_app()
-
-if __name__ == "__main__":
-    # Local dev only (FastCloud uses its own runner; this block won't execute there)
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+            "server": {"
