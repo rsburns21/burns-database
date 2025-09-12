@@ -240,7 +240,16 @@ async def echo(text: str) -> Dict[str, Any]:
 
 
 @mcp.tool(description="List server capabilities and config.")
-async def list_capabilities() -> Dict[str, Any]:
+async def list_capabilities(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Return a summary of the server configuration.
+
+    The optional ``params`` argument is ignored but accepted to
+    accommodate clients (such as the FastMCP Inspector) that always
+    supply a ``params`` dictionary.  Without this optional argument,
+    Pydantic would raise a validation error for unexpected keyword
+    arguments when the inspector calls the tool.
+    """
     return {
         "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "edge": {"url": _resolve_edge_url()},
@@ -252,7 +261,14 @@ async def list_capabilities() -> Dict[str, Any]:
 
 
 @mcp.tool(description="Return version info.")
-async def version_info() -> Dict[str, Any]:
+async def version_info(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Return the server name and version.
+
+    The optional ``params`` argument is accepted but ignored, allowing
+    clients that always pass a ``params`` dictionary to call this tool
+    without triggering a Pydantic validation error.
+    """
     return {"name": SERVER_NAME, "version": SERVER_VERSION}
 
 
@@ -301,8 +317,17 @@ async def http_post_allowed(url: str, body_json: Dict[str, Any]) -> Dict[str, An
 # Diagnostics (8-13)
 ###############################################################################
 
+
 @mcp.tool(description="Check server + edge + OpenAI health quickly.")
-async def health() -> Dict[str, Any]:
+async def health(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Return a snapshot of the server, edge function, and OpenAI API status.
+
+    The optional ``params`` argument is ignored but accepted for
+    compatibility with clients that unconditionally include a ``params``
+    object.  Without this parameter the inspector would raise a
+    validation error for unexpected keyword arguments.
+    """
     out: Dict[str, Any] = {
         "server": {"name": SERVER_NAME, "version": SERVER_VERSION, "ts": _now_ms()},
         "edge": {},
@@ -359,7 +384,12 @@ async def diag_edge(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
 
 @mcp.tool(description="Show config and defaults (raw).")
-async def diag_config() -> Dict[str, Any]:
+async def diag_config(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Return a raw view of the server's configuration and defaults.
+
+    Accepts an optional ``params`` argument for client compatibility.
+    """
     return {
         "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "edge": {"url": _resolve_edge_url()},
@@ -374,12 +404,19 @@ async def diag_config() -> Dict[str, Any]:
 
 
 @mcp.tool(description="Quick allowlist/host report.")
-async def diag_allowlist() -> Dict[str, Any]:
+async def diag_allowlist(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return the configured allowlist. Accepts an optional ``params`` dict."""
     return {"allowlist_hosts": ALLOWLIST_HOSTS}
 
 
 @mcp.tool(description="OpenAI connectivity smoke check.")
-async def diag_openai() -> Dict[str, Any]:
+async def diag_openai(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Perform a lightweight check against the OpenAI API.
+
+    Accepts an optional ``params`` dict for compatibility with clients that
+    always send parameters.
+    """
     if not OPENAI_API_KEY:
         return {"ok": False, "error": "OPENAI_API_KEY not set"}
     try:
@@ -508,39 +545,57 @@ async def edge_search(params: SearchParams) -> Dict[str, Any]:
 
 
 @mcp.tool(description="BM25 search via Edge.")
-async def bm25_search(
-    q: str, top_k: int = SEARCH_TOP_K, min_score: float = SEARCH_MIN_SCORE, rerank: bool = False
-) -> Dict[str, Any]:
-    return await _edge_search_core(
-        SearchParams(q=q, mode="bm25", top_k=top_k, min_score=min_score, rerank=rerank)
-    )
+async def bm25_search(params: SearchParams) -> Dict[str, Any]:
+    """
+    Perform a BM25-only search via the edge function.
+
+    Accepts a ``SearchParams`` object containing all search parameters.  The
+    ``mode`` field will be forced to "bm25" regardless of the value
+    provided by the caller.  This design accommodates clients that
+    construct requests as a single dictionary rather than separate
+    positional arguments (e.g., the FastMCP Inspector).
+    """
+    p = params.model_copy(update={"mode": "bm25"})
+    return await _edge_search_core(p)
 
 
 @mcp.tool(description="Vector similarity search via Edge.")
-async def vector_search(
-    q: str, top_k: int = SEARCH_TOP_K, min_score: float = SEARCH_MIN_SCORE, rerank: bool = False
-) -> Dict[str, Any]:
-    return await _edge_search_core(
-        SearchParams(q=q, mode="vector", top_k=top_k, min_score=min_score, rerank=rerank)
-    )
+async def vector_search(params: SearchParams) -> Dict[str, Any]:
+    """
+    Perform a pure vector similarity search via the edge function.
+
+    Accepts a ``SearchParams`` object.  The ``mode`` will be overridden
+    to "vector".  Using a single parameter object avoids Pydantic
+    validation errors when clients send a JSON dict for parameters.
+    """
+    p = params.model_copy(update={"mode": "vector"})
+    return await _edge_search_core(p)
 
 
 @mcp.tool(description="Hybrid search (vector + BM25) via Edge.")
-async def hybrid_search(
-    q: str, top_k: int = SEARCH_TOP_K, min_score: float = SEARCH_MIN_SCORE, rerank: bool = False
-) -> Dict[str, Any]:
-    return await _edge_search_core(
-        SearchParams(q=q, mode="hybrid", top_k=top_k, min_score=min_score, rerank=rerank)
-    )
+async def hybrid_search(params: SearchParams) -> Dict[str, Any]:
+    """
+    Perform a hybrid search (vector + BM25) via the edge function.
+
+    The incoming ``SearchParams`` object is accepted as-is but the
+    ``mode`` is forced to "hybrid".  This allows clients that send
+    parameters in a single JSON object to call this tool directly.
+    """
+    p = params.model_copy(update={"mode": "hybrid"})
+    return await _edge_search_core(p)
 
 
 @mcp.tool(description="Semantic search (alias to hybrid unless Edge defines differently).")
-async def semantic_search(
-    q: str, top_k: int = SEARCH_TOP_K, min_score: float = SEARCH_MIN_SCORE, rerank: bool = False
-) -> Dict[str, Any]:
-    return await _edge_search_core(
-        SearchParams(q=q, mode="semantic", top_k=top_k, min_score=min_score, rerank=rerank)
-    )
+async def semantic_search(params: SearchParams) -> Dict[str, Any]:
+    """
+    Perform a semantic search via the edge function.
+
+    Accept a ``SearchParams`` object and override the ``mode`` to
+    "semantic".  This wrapper accommodates clients that send one
+    parameter object rather than individual arguments.
+    """
+    p = params.model_copy(update={"mode": "semantic"})
+    return await _edge_search_core(p)
 
 
 @mcp.tool(description="Request embeddings for a query from Edge (action=embed_query).")
@@ -721,12 +776,14 @@ async def set_defaults(params: SetDefaultsParams) -> Dict[str, Any]:
 
 
 @mcp.tool(description="Get session defaults.")
-async def get_defaults() -> Dict[str, Any]:
+async def get_defaults(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return the current session defaults. Accepts optional ``params``."""
     return {"ok": True, "defaults": DEFAULTS.model_dump()}
 
 
 @mcp.tool(description="Reset session defaults to startup values.")
-async def reset_defaults() -> Dict[str, Any]:
+async def reset_defaults(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Reset the session defaults to their initial values. Accepts optional params."""
     DEFAULTS.mode = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()
     DEFAULTS.top_k = int(os.getenv("SEARCH_TOP_K", "10"))
     DEFAULTS.min_score = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
