@@ -3,55 +3,122 @@ name: Deploy to FastAPI Cloud
 on:
   push:
     branches: [ master ]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 30
+
+    # These variables are inherited by all steps
+    env:
+      APP_NAME: ${{ vars.APP_NAME || 'burns-database' }}
+      PORT: ${{ vars.PORT || '8080' }}
+      ENABLE_DIAG: ${{ vars.ENABLE_DIAG || 'true' }}
+      BASE_URL: ${{ vars.BASE_URL || 'https://burns-database.fastmcp.app' }}
+
+      # Secrets (set these in repo Secrets → Actions)
+      BDB_AUTH_TOKEN: ${{ secrets.BDB_AUTH_TOKEN }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # Optional: add FASTMCP_API_KEY if your CLI requires it
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install FastAPI Cloud CLI
+      - name: Install FastAPI deploy CLI (with fallback)
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          # EITHER of these is fine; pick ONE:
-          pip install fastapi-cloud-cli
-          # pip install "fastapi[standard]"
+          pip install fastapi-cloud-cli || true
+          if ! command -v fastapi-cloud >/dev/null 2>&1; then
+            pip install "fastapi[standard]"
+          fi
+          command -v fastapi-cloud || true
+          command -v fastapi || true
 
-      - name: Deploy
-        env:
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SUPABASE_ANON_KEY:        ${{ secrets.SUPABASE_ANON_KEY }}
-          SUPABASE_URL:             ${{ vars.SUPABASE_URL }}
-          OPENAI_API_KEY:           ${{ secrets.OPENAI_API_KEY }}
-          APP_NAME:                 ${{ vars.APP_NAME }}
-          PORT:                     ${{ vars.PORT }}
-          ENABLE_DIAG:              ${{ vars.ENABLE_DIAG }}
+      - name: Deploy to FastAPI Cloud
         run: |
-          APP_NAME_FIXED=${APP_NAME:-burnsdb}
-          PORT_FIXED=${PORT:-8080}
-          # FastAPI Cloud CLI uses the `fastapi` command
-          fastapi deploy \
-            --app "${APP_NAME_FIXED}" \
-            --start "uvicorn server:app --host 0.0.0.0 --port ${PORT_FIXED}" \
+          set -euxo pipefail
+          if command -v fastapi-cloud >/dev/null 2>&1; then
+            CLI="fastapi-cloud"
+          elif command -v fastapi >/dev/null 2>&1; then
+            CLI="fastapi"
+          else
+            echo "Neither fastapi-cloud nor fastapi is available"; exit 127
+          fi
+
+          PORT_FIXED="${PORT}"
+          $CLI deploy \
+            --project "burns-legal/burns-database" \
+            --entrypoint "uvicorn server:app --host 0.0.0.0 --port ${PORT_FIXED}" \
+            --env APP_NAME="${APP_NAME}" \
+            --env PORT="${PORT_FIXED}" \
+            --env ENABLE_DIAG="${ENABLE_DIAG}" \
+            --env BDB_AUTH_TOKEN="${BDB_AUTH_TOKEN}" \
             --env SUPABASE_URL="${SUPABASE_URL}" \
             --env SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SERVICE_ROLE_KEY}" \
             --env SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY}" \
             --env OPENAI_API_KEY="${OPENAI_API_KEY}" \
-            --env PORT="${PORT_FIXED}" \
-            --env ENABLE_DIAG="${ENABLE_DIAG}" \
-            --env EDGEFN_AUTH_MODE="service_role"
+            --env EDGEOFN_AUTH_MODE="service_role"
 
       - name: Set healthcheck route (best effort)
         if: always()
         run: |
-          # Some CLIs expose a healthcheck subcommand; safe to ignore failures
-          fastapi healthcheck set --app "${APP_NAME:-burnsdb}" --path "/mcp" || true
+          set -euxo pipefail
+          if command -v fastapi-cloud >/dev/null 2>&1; then
+            fastapi-cloud healthcheck set \
+              --app "${APP_NAME}" \
+              --url "/mcp/health" || true
+          elif command -v fastapi >/dev/null 2>&1; then
+            fastapi healthcheck set \
+              --app "${APP_NAME}" \
+              --path "/mcp" || true
+          fi
+
+      - name: Verify /mcp/health (post-deploy)
+        run: |
+          set -euxo pipefail
+          for i in {1..5}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
+              "${BASE_URL}/mcp/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "Health OK"
+              break
+            fi
+            echo "Health not ready (got $code), retrying in 5s..."
+            sleep 5
+          done
+          [ "$code" = "200" ] || (echo "Health check failed with $code"; exit 1)
+
+      - name: Verify Supabase connectivity
+        run: |
+          set -euxo pipefail
+          result=$(curl -sS -X POST \
+            -H "Authorization: Bearer ${BDB_AUTH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${BASE_URL}/mcp/tools/supabase_health")
+          echo "$result"
+          python - <<'PY'
+import json, sys
+d=json.loads("""$result""")
+assert "auth_ok" in d and "rest_ok" in d, "Missing keys in supabase_health output"
+# You can choose to fail the job if either is false, but often it's better to log.
+print("auth_ok =", d.get("auth_ok"), "rest_ok =", d.get("rest_ok"))
+PY
