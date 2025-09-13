@@ -1,43 +1,17 @@
+# fastmcp.yaml — used by FastCloud runner 
 name: burns-database
-version: 1.0.0
-description: Burns Database MCP server (FastMCP HTTP) targeting Supabase Edge function
-
-cloud:
-  provider: fastmcp
-  region: us-east-1
-  subdomain: burnsdb
-
+runtime:
+  python: "3.12"
 server:
   main: server.py
-  port: 8080
-  entrypoint: http  # ASGI app export used by platform
-
-env:
-  - SUPABASE_URL
-  - SUPABASE_SERVICE_ROLE_KEY
-  - SUPABASE_KEY
-  - OPENAI_API_KEY
-  - EDGEFN_URL
-  - ALLOWLIST_HOSTS
-  - SEARCH_MODE
-  - SEARCH_TOP_K
-  - SEARCH_MIN_SCORE
-  - LEXICAL_K
-  - MAX_FETCH_SIZE
-  - SNIPPET_LENGTH
-  - PORT
-  - ENABLE_DIAG
-
-features:
-  openapi: true
-  streaming: true
-  cors: true
-  progress: true
-
+  entrypoint: app
+  mcp_path: /mcp
+  stateless_http: true
+  json_response: true
 security:
-  auth_mode: bearer
-  cors:
-    enabled: true
-    allowed_origins: ["*"]
-    allowed_headers: ["Content-Type","Authorization","Accept","Origin"]
-    allowed_methods: ["GET","POST","OPTIONS"]
+  # Set 'oauth' in production for ChatGPT connector popup; 'bearer' for staging/CI.
+  auth_mode: oauth
+cors:
+  allow_origins: ["*"]
+  allow_methods: ["GET","POST","OPTIONS","HEAD"]
+  allow_headers: ["Content-Type","Authorization","Accept","Origin"]
