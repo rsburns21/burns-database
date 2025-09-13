@@ -1,7 +1,7 @@
 # server.py
-# Burns Database MCP Server — FastMCP Streamable HTTP (stateless) + Supabase/Edge tools
-# Auth is handled by FastCloud at the edge (OAuth). No in-app bearer middleware.
-# Version: 4.5.0
+# Burns Database MCP Server — Streamable HTTP (stateless) + Supabase/Edge tools
+# Auth is handled by FastCloud (OAuth in prod or bearer in staging). No in-app bearer middleware.
+# Version: 5.1.0
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from fastmcp.server.http import create_streamable_http_app
 # ---------------------------
 
 SERVER_NAME = os.getenv("APP_NAME", "burns-database").strip()
-SERVER_VERSION = os.getenv("APP_VERSION", "4.5.0").strip()
+SERVER_VERSION = os.getenv("APP_VERSION", "5.1.0").strip()
 MCP_PATH = "/mcp"
 
 # Supabase & Edge
@@ -41,11 +41,12 @@ SUPABASE_SERVICE_ROLE_KEY = (
     or os.getenv("SUPABASE_SERVICE_KEY", "").strip()
     or ""
 )
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()  # optional catch-all
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip() or os.getenv("SUPABASE_KEY","").strip()
 
+# IMPORTANT: Use the exact working functions URL if set; otherwise default to project endpoint
 EDGEFN_URL = os.getenv(
     "EDGEFN_URL",
-    "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search",
+    "https://nqkzqcsqfvpquticvwmk.functions.supabase.co/advanced_semantic_search",
 ).strip()
 
 # Optional OpenAI (used only for diagnostics/rerank ping)
@@ -71,16 +72,20 @@ ALLOWLIST_HOSTS: List[str] = [
 # Tunables
 MAX_FETCH_SIZE = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
 SNIPPET_LENGTH = int(os.getenv("SNIPPET_LENGTH", "500"))
-HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "20"))
+HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
 
+# Search defaults (edge function accepts both snake_case and camelCase; we send both)
 SEARCH_MODE = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()
 SEARCH_TOP_K = int(os.getenv("SEARCH_TOP_K", "10"))
 SEARCH_MIN_SCORE = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
-LEXICAL_K = int(os.getenv("LEXICAL_K", "0"))
-EMBED_DIM = 384
+# Non-zero lexical fallback ensures BM25 is attempted even if vector path is unavailable
+LEXICAL_K = int(os.getenv("LEXICAL_K", "100"))
+
+# Diagnostics toggle
+ENABLE_DIAG = (os.getenv("ENABLE_DIAG", "0").strip() in ("1","true","True","yes","Y"))
 
 # ---------------------------
-# Optional Supabase client
+# Optional Supabase client (for direct table fetches and keyword fallback)
 # ---------------------------
 
 try:
@@ -114,7 +119,9 @@ def _truncate(s: str, n: int = SNIPPET_LENGTH) -> str:
     return s if len(s) <= n else s[: n - 3] + "..."
 
 def _resolve_edge_url() -> str:
-    return EDGEFN_URL
+    # Support either /functions/v1/<fn> or functions.supabase.co/<fn>; normalize trailing slashes
+    u = EDGEFN_URL.rstrip("/")
+    return u
 
 def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
     try:
@@ -130,6 +137,7 @@ def make_edge_headers() -> Dict[str, str]:
     if key:
         headers["apikey"] = key
         headers["Authorization"] = f"Bearer {key}"
+    # Do not set x-authless unless you intentionally want service-role without Authorization
     return headers
 
 async def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any], str]:
@@ -190,7 +198,7 @@ class SearchParams(BaseModel):
     mode: str = Field(SEARCH_MODE, description="vector|bm25|hybrid|semantic")
     top_k: int = Field(SEARCH_TOP_K, ge=1, le=200)
     min_score: float = Field(SEARCH_MIN_SCORE, ge=0.0)
-    rerank: bool = Field(False, description="Enable rerank if Edge supports it")
+    rerank: bool = Field(True, description="Enable rerank if Edge supports it")
     label: Optional[str] = None
     metadata_filter: Optional[Dict[str, Any]] = None
 
@@ -216,12 +224,6 @@ class EdgeActionParams(BaseModel):
     action: str
     payload: Dict[str, Any] = Field(default_factory=dict)
 
-class CodexAgentParams(BaseModel):
-    action: str  # start|stop|status|restart|add_task
-    task_data: Optional[Dict[str, Any]] = None
-    task_type: Optional[str] = None
-    config_override: Optional[Dict[str, Any]] = None
-
 # ---------------------------
 # Utility / Diagnostics tools
 # ---------------------------
@@ -237,7 +239,6 @@ async def list_capabilities(params: Optional[Dict[str, Any]] = None) -> Dict[str
         "edge": {"url": _resolve_edge_url()},
         "defaults": DEFAULTS.model_dump(),
         "allowlist_hosts": ALLOWLIST_HOSTS,
-        "embed_dim": EMBED_DIM,
         "openai_enabled": bool(OPENAI_API_KEY),
         "supabase_url_set": bool(SUPABASE_URL),
     }
@@ -327,10 +328,12 @@ async def diag_config(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
             "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_SERVICE_ROLE_KEY),
             "OPENAI_API_KEY": bool(OPENAI_API_KEY),
             "SUPABASE_URL": bool(SUPABASE_URL),
+            "EDGEFN_URL": bool(EDGEFN_URL),
         },
         "allowlist_hosts": ALLOWLIST_HOSTS,
         "defaults": DEFAULTS.model_dump(),
         "http_timeout_s": HTTP_TIMEOUT_S,
+        "enable_diag": ENABLE_DIAG,
     }
 
 @mcp.tool(description="Quick allowlist/host report.")
@@ -359,14 +362,19 @@ async def _edge_search_core(params: SearchParams) -> Dict[str, Any]:
         return {"ok": False, "error": f"host '{host}' not in allowlist", "url": edge_url}
 
     top_k = params.top_k or DEFAULTS.top_k
+    # Send both snake_case and camelCase to match your Deno handler exactly.
     body: Dict[str, Any] = {
         "query": params.q,
+        "q": params.q,
         "mode": (params.mode or DEFAULTS.mode).lower(),
+        "searchType": (params.mode or DEFAULTS.mode).lower(),
         "k": top_k,
-        "matchCount": top_k,
-        "top_k": top_k,
+        "topK": top_k,
+        "limit": top_k,
         "min_score": params.min_score if params.min_score is not None else DEFAULTS.min_score,
         "lexical_k": DEFAULTS.lexical_k,
+        "lexicalK": DEFAULTS.lexical_k,
+        "rerank": bool(params.rerank),
     }
     if params.label:
         body["label"] = params.label
@@ -413,75 +421,45 @@ async def embed_query(q: str, params: Optional[Dict[str, Any]] = None) -> Dict[s
     ok, host = _is_host_allowlisted(edge_url)
     if not ok:
         return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    status, data, text = await _post_json(edge_url, {"action": "embed_query", "query": q}, headers)
+    status, data, text = await _post_json(edge_url, {"action": "embed_query", "query": q, "q": q}, headers)
     if status != 200:
         return {"ok": False, "status": status, "error": data if data else _truncate(text)}
     emb = data.get("embedding") or data.get("vector") or []
     return {"ok": True, "dim": len(emb), "embedding": emb}
 
-@mcp.tool(description="Label a document or match via Edge (action=label).")
-async def label_result(params: LabelParams, _extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    body = {"action": "label", "doc_id": params.doc_id, "label": params.label}
-    status, data, text = await _post_json(edge_url, body, headers)
-    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
-
-@mcp.tool(description="List collections/sources from Edge if supported.")
-async def list_collections(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    payload: Dict[str, Any] = {"action": "list_collections"}
-    if isinstance(params, dict):
-        payload.update({k: v for k, v in params.items() if v is not None})
-    status, data, text = await _post_json(edge_url, payload, headers)
-    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
-
-@mcp.tool(description="Fetch a document (by id) via Edge if supported.")
-async def get_document(doc_id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    edge_url = _resolve_edge_url()
-    headers = make_edge_headers()
-    ok, host = _is_host_allowlisted(edge_url)
-    if not ok:
-        return {"ok": False, "error": f"host '{host}' not in allowlist"}
-    status, data, text = await _post_json(edge_url, {"action": "get_document", "doc_id": doc_id}, headers)
-    return {"ok": status == 200, "status": status, "json": data if data else {}, "text": _truncate(text)}
-
 # ---------------------------
-# Simplified search wrappers
+# Simplified search wrappers (with safe lexical fallback)
 # ---------------------------
 
 @mcp.tool(description="Canonical search: return IDs + snippets for follow‑up fetch().")
 async def search(query: str, limit: int = 10, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    base = await edge_search(SearchParams(q=query, mode=DEFAULTS.mode, top_k=limit, min_score=DEFAULTS.min_score, rerank=False))
-    if not base.get("ok"):
-        return {"ok": False, "error": base.get("error", "search_failed"), "results": []}
+    base = await edge_search(SearchParams(q=query, mode=DEFAULTS.mode, top_k=limit, min_score=DEFAULTS.min_score, rerank=True))
+    # Primary happy path (edge function returned results)
     items: List[Dict[str, Any]] = []
-    for r in base.get("raw", {}).get("results", []):
-        ex_id = r.get("exhibit_id") or r.get("id") or "Unknown"
-        snippet = _truncate(r.get("text") or r.get("chunk") or r.get("content") or "", n=DEFAULTS.snippet_length)
-        score = r.get("score") or r.get("similarity")
-        items.append({"id": ex_id, "snippet": snippet, "score": score})
+    if base.get("ok"):
+        for r in (base.get("raw", {}) or {}).get("results", []):
+            ex_id = r.get("exhibit_id") or r.get("id") or _normalize_exhibit_id(r.get("doc_id","")) or "Unknown"
+            snippet = _truncate(r.get("snippet") or r.get("text") or r.get("chunk") or r.get("content") or "", n=DEFAULTS.snippet_length)
+            score = r.get("score") or r.get("similarity")
+            items.append({"id": ex_id, "snippet": snippet, "score": score})
+    # Fallback: if edge returned 0 results but Supabase client is available, do BM25 text_search
+    if not items and _SUPABASE:
+        try:
+            resp = (
+                _SUPABASE.table("vector_embeddings")
+                .select("exhibit_id,text")
+                .text_search("text", query, {"config": "english", "type": "websearch"})
+                .limit(max(1, min(int(limit), 50)))
+                .execute()
+            )
+            for r in resp.data or []:
+                ex_id = r.get("exhibit_id") or "Unknown"
+                snippet = _truncate(r.get("text") or "", n=DEFAULTS.snippet_length)
+                items.append({"id": ex_id, "snippet": snippet, "fallback": "bm25"})
+        except Exception as e:
+            # best effort; keep empty
+            items = items
     return {"ok": True, "results": items}
-
-@mcp.tool(description="High-level semantic/hybrid search with concise snippets.")
-async def search_legal(query: str, top_k: int = 10, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    res = await hybrid_search(SearchParams(q=query, mode="hybrid", top_k=top_k, min_score=DEFAULTS.min_score, rerank=False))
-    if not res.get("ok"):
-        return res
-    items: List[Dict[str, Any]] = []
-    for r in res.get("raw", {}).get("results", []):
-        ex_id = r.get("exhibit_id") or r.get("id") or "Unknown"
-        snippet = _truncate(r.get("text") or r.get("chunk") or r.get("content") or "", n=DEFAULTS.snippet_length)
-        score = r.get("score") or r.get("similarity")
-        items.append({"exhibit_id": ex_id, "snippet": snippet, "score": score})
-    return {"ok": True, "items": items}
 
 # ---------------------------
 # Supabase-backed helpers
@@ -587,40 +565,6 @@ async def keyword_search(query: str, top_k: int = 10, params: Optional[Dict[str,
     items = [{"exhibit_id": r.get("exhibit_id", "Unknown"), "snippet": _truncate(r.get("text", ""))} for r in rows]
     return {"ok": True, "items": items}
 
-@mcp.tool(description="List claims (optional status filter).")
-async def list_claims(status: Optional[str] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not _SUPABASE:
-        return {"ok": False, "error": "supabase_client_not_initialized", "claims": []}
-    try:
-        q = _SUPABASE.table("claims").select("*")
-        if status:
-            q = q.ilike("status", status)
-        rows = q.execute().data or []
-        return {"ok": True, "claims": rows}
-    except Exception as e:
-        return {"ok": False, "error": f"fetch_error:{e}", "claims": []}
-
-@mcp.tool(description="Facts for a given claim.")
-async def get_facts_by_claim(claim_id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not _SUPABASE:
-        return {"ok": False, "error": "supabase_client_not_initialized", "facts": []}
-    try:
-        rows = _SUPABASE.table("facts").select("*").eq("claim_id", claim_id).execute().data or []
-        return {"ok": True, "facts": rows}
-    except Exception as e:
-        return {"ok": False, "error": f"fetch_error:{e}", "facts": []}
-
-@mcp.tool(description="Facts for a given exhibit.")
-async def get_facts_by_exhibit(exhibit_id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not _SUPABASE:
-        return {"ok": False, "error": "supabase_client_not_initialized", "facts": []}
-    eid = _normalize_exhibit_id(exhibit_id)
-    try:
-        rows = _SUPABASE.table("facts").select("*").eq("exhibit_id", eid).execute().data or []
-        return {"ok": True, "facts": rows}
-    except Exception as e:
-        return {"ok": False, "error": f"fetch_error:{e}", "facts": []}
-
 @mcp.tool(description="Counts of key tables.")
 async def get_case_statistics(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not _SUPABASE:
@@ -642,123 +586,6 @@ async def get_case_statistics(params: Optional[Dict[str, Any]] = None) -> Dict[s
     except Exception as e3:
         stats["num_facts"] = f"error:{e3}"
     return {"ok": True, "statistics": stats}
-
-@mcp.tool(description="Static example timeline.")
-async def get_case_timeline(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    timeline = [
-        {"date": "2020-11-06", "event": "Operating Agreement for Floorable LLC signed"},
-        {"date": "2021-09-15", "event": "Employee termination that led to breach allegation"},
-        {"date": "2022-01-05", "event": "Legal complaint filed by R. Burns"},
-        {"date": "2023-03-10", "event": "Discovery phase begins, key evidence collected"},
-        {"date": "2024-07-22", "event": "Trial scheduled in California Superior Court"},
-    ]
-    return {"ok": True, "timeline": timeline}
-
-@mcp.tool(description="Entities list.")
-async def get_entities(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not _SUPABASE:
-        return {"ok": False, "error": "supabase_client_not_initialized", "entities": []}
-    try:
-        rows = _SUPABASE.table("entities").select("*").execute().data or []
-        return {"ok": True, "entities": rows}
-    except Exception as e:
-        return {"ok": False, "error": f"fetch_error:{e}", "entities": []}
-
-@mcp.tool(description="Individuals list (optional role filter).")
-async def get_individuals(role: Optional[str] = None, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not _SUPABASE:
-        return {"ok": False, "error": "supabase_client_not_initialized", "individuals": []}
-    try:
-        q = _SUPABASE.table("individuals").select("*")
-        if role:
-            q = q.ilike("role", role)
-        rows = q.execute().data or []
-        return {"ok": True, "individuals": rows}
-    except Exception as e:
-        return {"ok": False, "error": f"fetch_error:{e}", "individuals": []}
-
-# Canonical fetch
-@mcp.tool(description="Given an exhibit ID, return full content and metadata.")
-async def fetch(id: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if not id:
-        return {"ok": False, "error": "missing_id"}
-    res = await fetch_exhibit(id)
-    if not res.get("ok"):
-        return {"ok": False, "error": res.get("error", "fetch_failed"), "id": id}
-    pages = res.get("pages", []) or []
-    content = "\n\n".join(pages) if isinstance(pages, list) else str(pages)
-    meta = {k: v for k, v in res.items() if k in ("exhibit_id", "description", "filename")}
-    return {"ok": True, "id": res.get("exhibit_id", id), "content": content, "metadata": meta}
-
-# ---------------------------
-# Codex Agent mgmt (kept)
-# ---------------------------
-
-@mcp.tool(description="Manage codex background agent (start/stop/status/restart/add_task).")
-async def codex_agent_control(params: CodexAgentParams) -> Dict[str, Any]:
-    action = (params.action or "").lower()
-    try:
-        if action == "start":
-            r = subprocess.run([sys.executable, "launch_codex_agent.py", "--daemon"], capture_output=True, text=True, timeout=30)
-            return {"ok": r.returncode == 0, "action": "start", "stdout": r.stdout, "stderr": r.stderr, "return_code": r.returncode}
-        elif action == "stop":
-            r = subprocess.run([sys.executable, "launch_codex_agent.py", "stop"], capture_output=True, text=True, timeout=30)
-            return {"ok": r.returncode == 0, "action": "stop", "stdout": r.stdout, "stderr": r.stderr, "return_code": r.returncode}
-        elif action == "status":
-            r = subprocess.run([sys.executable, "launch_codex_agent.py", "status"], capture_output=True, text=True, timeout=10)
-            return {"ok": r.returncode == 0, "action": "status", "stdout": r.stdout, "stderr": r.stderr, "return_code": r.returncode, "running": r.returncode == 0}
-        elif action == "restart":
-            r = subprocess.run([sys.executable, "launch_codex_agent.py", "restart"], capture_output=True, text=True, timeout=60)
-            return {"ok": r.returncode == 0, "action": "restart", "stdout": r.stdout, "stderr": r.stderr, "return_code": r.returncode}
-        elif action == "add_task":
-            if not params.task_type or not params.task_data:
-                return {"ok": False, "error": "task_type and task_data are required for add_task"}
-            import uuid
-            task_id = str(uuid.uuid4())
-            payload = {"task_id": task_id, "task_type": params.task_type, "payload": params.task_data, "created_at": _now_ms()}
-            task_file = os.path.join(tempfile.gettempdir(), f"codex_task_{task_id}.json")
-            with open(task_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-            return {"ok": True, "action": "add_task", "task_id": task_id, "task_file": task_file, "message": "Task queued"}
-        else:
-            return {"ok": False, "error": f"Unknown action: {action}"}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "Operation timed out"}
-    except Exception as e:
-        return {"ok": False, "error": f"Agent control error: {e}"}
-
-@mcp.tool(description="Codex agent info.")
-async def codex_agent_info(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    try:
-        r = subprocess.run([sys.executable, "launch_codex_agent.py", "status"], capture_output=True, text=True, timeout=10)
-        is_running = r.returncode == 0
-        cfg = {
-            "agent_name": os.getenv("CODEX_AGENT_NAME", "burns-codex-agent"),
-            "max_workers": os.getenv("CODEX_MAX_WORKERS", "4"),
-            "check_interval": os.getenv("CODEX_CHECK_INTERVAL", "30.0"),
-            "enable_health_checks": os.getenv("CODEX_ENABLE_HEALTH_CHECKS", "true"),
-            "log_level": os.getenv("CODEX_LOG_LEVEL", "INFO"),
-            "log_file": os.getenv("CODEX_LOG_FILE"),
-            "pid_file": os.getenv("CODEX_PID_FILE", os.path.join(tempfile.gettempdir(), "codex_agent.pid")),
-            "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
-            "openai_configured": bool(OPENAI_API_KEY),
-            "codex_model": os.getenv("CODEX_MODEL", "gpt-4"),
-            "codex_endpoint": os.getenv("CODEX_ENDPOINT", "https://api.openai.com/v1/chat/completions"),
-            "max_task_duration": os.getenv("CODEX_MAX_TASK_DURATION", "300"),
-            "task_retry_attempts": os.getenv("CODEX_TASK_RETRY_ATTEMPTS", "3"),
-            "task_retry_delay": os.getenv("CODEX_TASK_RETRY_DELAY", "5.0"),
-        }
-        return {"ok": True, "running": is_running, "status_output": r.stdout or "", "config": cfg}
-    except Exception as e:
-        return {"ok": False, "error": f"Failed to get agent info: {e}"}
-
-@mcp.tool(description="Create a sample codex agent configuration file.")
-async def codex_agent_create_config(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    try:
-        r = subprocess.run([sys.executable, "launch_codex_agent.py", "create-config"], capture_output=True, text=True, timeout=10)
-        return {"ok": r.returncode == 0, "stdout": r.stdout, "stderr": r.stderr, "message": "Sample configuration file created: codex_agent_config.json"}
-    except Exception as e:
-        return {"ok": False, "error": f"Failed to create config: {e}"}
 
 # ---------------------------
 # Defaults mgmt
@@ -789,7 +616,7 @@ async def reset_defaults(params: Optional[Dict[str, Any]] = None) -> Dict[str, A
     DEFAULTS.mode = (os.getenv("SEARCH_MODE") or "hybrid").strip().lower()
     DEFAULTS.top_k = int(os.getenv("SEARCH_TOP_K", "10"))
     DEFAULTS.min_score = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
-    DEFAULTS.lexical_k = int(os.getenv("LEXICAL_K", "0"))
+    DEFAULTS.lexical_k = int(os.getenv("LEXICAL_K", "100"))
     globals()["MAX_FETCH_SIZE"] = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
     globals()["SNIPPET_LENGTH"] = int(os.getenv("SNIPPET_LENGTH", "500"))
     return {"ok": True, "defaults": DEFAULTS.model_dump()}
@@ -818,7 +645,6 @@ async def _root_ok(request: Request):
     return JSONResponse({"ok": True, "name": SERVER_NAME, "version": SERVER_VERSION, "ts": _now_ms()})
 
 async def _health_get(request: Request):
-    # No in-app auth; FastCloud may gate this route if deployment is private
     return JSONResponse({"name": SERVER_NAME, "version": SERVER_VERSION, "ok": True})
 
 async def _health_head(request: Request):
@@ -833,11 +659,12 @@ async def _diag_http(request: Request):
         "supabase_url_set": bool(SUPABASE_URL),
         "openai_key_set": bool(OPENAI_API_KEY),
         "stateless_http": True,
+        "enable_diag": ENABLE_DIAG,
     })
 
 async def _supabase_health(request: Request):
     headers = {}
-    key = SUPABASE_SERVICE_ROLE_KEY
+    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY
     if key:
         headers = {"apikey": key, "Authorization": f"Bearer {key}"}
     status_auth = 0
@@ -877,7 +704,6 @@ _middleware = [
                allow_origins=["*"],
                allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
                allow_headers=["Content-Type", "Authorization", "Accept", "Origin"]),
-    # No bearer middleware; FastCloud handles OAuth
 ]
 
 # Build the Streamable HTTP app
