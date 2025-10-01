@@ -1,6 +1,6 @@
 # server.py
-# Burns Database MCP Server — Streamable HTTP + Supabase Edge / PostgREST + optional manifest fallback
-# Compatible with fastmcp 2.12.x (instantiate FastMCP() with no kwargs)
+# Burns Database MCP Server — Streamable HTTP + Supabase Edge / PostgREST (+ manifest fallback)
+# Compatible with fastmcp 2.12.x; do NOT pass kwargs to FastMCP().
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import csv
+import json
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -15,12 +16,12 @@ import httpx
 
 # FastMCP
 from fastmcp import FastMCP
-from fastmcp.server.http import create_streamable_http_app
 
-# Starlette for extra routes
+# Starlette app + routes
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Route
+from starlette.routing import Route, Mount
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 
@@ -33,36 +34,19 @@ except Exception as e:
     print("[BDB] Supabase SDK import failed (Edge-only mode still works):", e, file=sys.stderr)
 
 # ------------------------------------------------------------------------------
-# Canonical BDB facts / env
+# Canonical BDB env / facts
 # ------------------------------------------------------------------------------
 
-SERVER_NAME = os.getenv("APP_NAME", "BDB").strip()
-SERVER_VERSION = os.getenv("APP_VERSION", "6.3").strip()
+SERVER_NAME = os.getenv("APP_NAME", "burns-database").strip()
+SERVER_VERSION = os.getenv("APP_VERSION", "1.0").strip()
 GIT_SHA = os.getenv("GIT_SHA", "").strip()
-MCP_PATH = "/mcp"  # mount path
-
 PORT = int(os.getenv("PORT", "8080"))
+
+# Mount path
+MCP_PATH = "/mcp"
+
+# CORS / Allowlist
 CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*")
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://nqkzqcsqfvpquticvwmk.supabase.co").strip()
-SUPABASE_SERVICE_ROLE_KEY = (
-    os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    or os.getenv("SUPABASE_SERVICE_KEY", "").strip()
-)
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()  # unused if service role present
-
-EDGEFN_URL = os.getenv(
-    "EDGEFN_URL",
-    "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search",
-).strip()
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-# Optional manifest (CSV) mapping exhibits; either PATH or URL
-MANIFEST_PATH = os.getenv("MANIFEST_PATH", "").strip()
-MANIFEST_URL = os.getenv("MANIFEST_URL", "").strip()
-
 ALLOWLIST_DEFAULT = [
     "nqkzqcsqfvpquticvwmk.supabase.co",
     "nqkzqcsqfvpquticvwmk.functions.supabase.co",
@@ -79,6 +63,24 @@ ALLOWLIST_HOSTS: List[str] = [
     if h.strip()
 ]
 
+# Supabase + Edge Function
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://nqkzqcsqfvpquticvwmk.supabase.co").strip()
+SUPABASE_SERVICE_ROLE_KEY = (
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    or os.getenv("SUPABASE_SERVICE_KEY", "").strip()
+)
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()  # unused with service role
+
+EDGEFN_URL = os.getenv(
+    "EDGEFN_URL",
+    "https://nqkzqcsqfvpquticvwmk.supabase.co/functions/v1/advanced_semantic_search",
+).strip()
+
+# Optional manifest (CSV “map to DB”)
+MANIFEST_PATH = os.getenv("MANIFEST_PATH", "").strip()
+MANIFEST_URL = os.getenv("MANIFEST_URL", "").strip()
+
+# Tunables
 MAX_FETCH_SIZE = int(os.getenv("MAX_FETCH_SIZE", "1000000"))
 SNIPPET_LENGTH = int(os.getenv("SNIPPET_LENGTH", "500"))
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "25"))
@@ -89,8 +91,50 @@ SEARCH_MIN_SCORE = float(os.getenv("SEARCH_MIN_SCORE", "0.0"))
 LEXICAL_K = int(os.getenv("LEXICAL_K", "100"))
 ENABLE_DIAG = (os.getenv("ENABLE_DIAG", "1").strip().lower() in ("1", "true", "yes", "y"))
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # not used for vector store, only optional rerank/summarize
+
 # ------------------------------------------------------------------------------
-# Supabase client (optional; used for fetch + lexical fallback)
+# Allowlist / headers / HTTP utils
+# ------------------------------------------------------------------------------
+
+def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        return (host in ALLOWLIST_HOSTS, host)
+    except Exception:
+        return (False, "")
+
+def _truncate(s: str, n: int = SNIPPET_LENGTH) -> str:
+    if not s:
+        return ""
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+
+def make_edge_headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
+    if key:
+        headers["apikey"] = key
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+async def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any], str]:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+        resp = await client.post(url, json=body, headers=headers)
+        text = resp.text
+        data: Dict[str, Any] = {}
+        # Try JSON, otherwise parse from text
+        try:
+            data = await resp.json()
+        except Exception:
+            try:
+                if text and text.strip().startswith(("{", "[")):
+                    data = json.loads(text)
+            except Exception:
+                data = {}
+        return (resp.status_code, data, text)
+
+# ------------------------------------------------------------------------------
+# Supabase client (optional)
 # ------------------------------------------------------------------------------
 
 _SUPABASE: Optional[SupabaseClient] = None
@@ -105,18 +149,10 @@ else:
         print("[BDB] Supabase client not initialized (missing SUPABASE_URL or SERVICE_ROLE_KEY).", file=sys.stderr)
 
 # ------------------------------------------------------------------------------
-# Manifest (optional)
+# Manifest loader (optional)
 # ------------------------------------------------------------------------------
 
 _MANIFEST: List[Dict[str, Any]] = []
-
-def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
-    try:
-        u = urlparse(url)
-        host = (u.hostname or "").lower()
-        return (host in ALLOWLIST_HOSTS, host)
-    except Exception:
-        return (False, "")
 
 def _load_manifest() -> None:
     global _MANIFEST
@@ -124,28 +160,17 @@ def _load_manifest() -> None:
         if MANIFEST_PATH and os.path.exists(MANIFEST_PATH):
             with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
                 _manifest_from_csv(f.read())
-                print(f"[BDB] Manifest loaded from file: {MANIFEST_PATH} ({len(_MANIFEST)} rows)", file=sys.stderr)
-                return
+            print(f"[BDB] Manifest loaded from file: {MANIFEST_PATH} ({len(_MANIFEST)} rows)", file=sys.stderr)
+            return
         if MANIFEST_URL:
             ok, host = _is_host_allowlisted(MANIFEST_URL)
             if not ok:
                 print(f"[BDB] Manifest URL host not allowlisted: {host}", file=sys.stderr)
                 return
-            try:
-                import asyncio
-                async def _fetch():
-                    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-                        r = await client.get(MANIFEST_URL, headers={"Accept": "text/csv"})
-                        r.raise_for_status()
-                        return r.text
-                text = asyncio.get_event_loop().run_until_complete(_fetch())
-            except RuntimeError:
-                # If event loop is already running (some platforms), do a simple sync fallback
-                with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
-                    r = client.get(MANIFEST_URL, headers={"Accept": "text/csv"})
-                    r.raise_for_status()
-                    text = r.text
-            _manifest_from_csv(text)
+            with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
+                r = client.get(MANIFEST_URL, headers={"Accept": "text/csv"})
+                r.raise_for_status()
+                _manifest_from_csv(r.text)
             print(f"[BDB] Manifest loaded from URL: {MANIFEST_URL} ({len(_MANIFEST)} rows)", file=sys.stderr)
     except Exception as e:
         print("[BDB] Manifest load failed:", e, file=sys.stderr)
@@ -158,40 +183,15 @@ def _manifest_from_csv(text: str) -> None:
     try:
         reader = csv.DictReader(text.splitlines())
         for row in reader:
-            # normalize keys
-            nrow = { (k.strip() if k else k): (v.strip() if isinstance(v, str) else v) for k,v in row.items() }
-            _MANIFEST.append(nrow)
+            _MANIFEST.append({(k.strip() if k else k): (v.strip() if isinstance(v, str) else v) for k, v in row.items()})
     except Exception as e:
         print("[BDB] Manifest parse failed:", e, file=sys.stderr)
 
 _load_manifest()
 
 # ------------------------------------------------------------------------------
-# Helpers
+# Normalization / EF parsing
 # ------------------------------------------------------------------------------
-
-def _truncate(s: str, n: int = SNIPPET_LENGTH) -> str:
-    if not s:
-        return ""
-    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
-
-def make_edge_headers() -> Dict[str, str]:
-    headers: Dict[str, str] = {"Content-Type": "application/json"}
-    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
-    if key:
-        headers["apikey"] = key
-        headers["Authorization"] = f"Bearer {key}"
-    return headers
-
-async def _post_json(url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Tuple[int, Dict[str, Any], str]:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        resp = await client.post(url, json=body, headers=headers)
-        text = resp.text
-        try:
-            data = await resp.json()
-        except Exception:
-            data = {}
-        return (resp.status_code, data, text)
 
 def _normalize_exhibit_id(eid: str) -> str:
     s = (eid or "").strip()
@@ -202,15 +202,8 @@ def _normalize_exhibit_id(eid: str) -> str:
         return f"Ex{int(s[2:]):03d}"
     return s
 
-# --- Edge result parsing (robust across shapes) --------------------------------
-
-_ID_KEYS = (
-    "exhibit_id", "exhibitId", "id", "doc_id", "document_id", "documentId",
-    "key", "pk", "uuid"
-)
-_SNIPPET_KEYS = (
-    "snippet", "text", "chunk", "content", "passage", "preview", "summary"
-)
+_ID_KEYS = ("exhibit_id", "exhibitId", "id", "doc_id", "document_id", "documentId", "key", "pk", "uuid")
+_SNIPPET_KEYS = ("snippet", "content", "text", "chunk", "passage", "preview", "summary")
 _SCORE_KEYS = ("score", "similarity", "relevance", "rank", "distance")
 
 def _prefer_list(d: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -220,7 +213,6 @@ def _prefer_list(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         v = d.get(k)
         if isinstance(v, list):
             return v
-    # nested one deeper
     for v in d.values():
         if isinstance(v, dict):
             lst = _prefer_list(v)
@@ -252,28 +244,34 @@ def _extract_results_from_edge(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         rid = _normalize_exhibit_id(str(rid))
         snippet = _get_first(r, _SNIPPET_KEYS) or ""
         score = _get_first(r, _SCORE_KEYS)
-        # distance -> convert to similarity-ish
         if score is None and "distance" in r:
             try:
-                dist = float(r.get("distance"))
-                score = 1.0 - dist
+                score = 1.0 - float(r.get("distance"))
             except Exception:
                 score = None
         out.append({"id": rid, "snippet": _truncate(str(snippet)), "score": score})
     return out
 
 # ------------------------------------------------------------------------------
-# Retrieval core (no decorators here)
+# EF + Supabase cores (no decorators)
 # ------------------------------------------------------------------------------
 
 def _resolve_edge_url() -> str:
     return EDGEFN_URL
 
+def _as_int(val: Optional[Any], default_: int) -> int:
+    try:
+        if val is None:
+            return default_
+        return int(val)
+    except Exception:
+        return default_
+
 async def _edge_search_core(
     q: str,
     mode: Optional[str] = None,
     top_k: Optional[int] = None,
-    limit: Optional[int] = None,          # accept both names; MCP Inspector uses "limit"
+    limit: Optional[int] = None,
     min_score: Optional[float] = None,
     rerank: Optional[bool] = True,
     label: Optional[str] = None,
@@ -285,9 +283,8 @@ async def _edge_search_core(
         return {"ok": False, "error": f"host '{host}' not in allowlist", "url": edge_url}
 
     m = (mode or SEARCH_MODE).lower()
-    k = int(limit if limit is not None else (top_k if top_k is not None else SEARCH_TOP_K))
+    k = _as_int(limit if limit is not None else top_k, SEARCH_TOP_K)
 
-    # Build liberal body (tolerates different EF parameter names)
     body: Dict[str, Any] = {
         "action": "search",
         "query": q,
@@ -311,13 +308,34 @@ async def _edge_search_core(
     if not out["ok"]:
         out["error"] = data if data else _truncate(text)
         return out
-    out["raw"] = data
+    out["raw"] = data if data else (json.loads(text) if text and text.strip().startswith(("{", "[")) else {})
     return out
 
+async def _edge_fetch_exhibit_text(exhibit_id: str, k: int = 2000) -> str:
+    """
+    Fallback: use EF to retrieve many chunks for an exhibit by searching its ID.
+    Concatenate 'content'/'text'/'chunk' fields for items with matching exhibit_id.
+    """
+    base = await _edge_search_core(q=_normalize_exhibit_id(exhibit_id), mode="lexical", top_k=k, limit=k, rerank=False)
+    if not base.get("ok"):
+        return ""
+    payload = base.get("raw", {}) or {}
+    items = _prefer_list(payload)
+    chunks: List[str] = []
+    for r in items:
+        if not isinstance(r, dict):
+            continue
+        ex = str(_get_first(r, _ID_KEYS) or "").strip()
+        # some EFs put exhibit_id in a distinct field; check both
+        ex2 = str(r.get("exhibit_id") or r.get("exhibitId") or "").strip()
+        if _normalize_exhibit_id(ex) != _normalize_exhibit_id(exhibit_id) and _normalize_exhibit_id(ex2) != _normalize_exhibit_id(exhibit_id):
+            continue
+        txt = _get_first(r, ("content", "text", "chunk"))
+        if txt:
+            chunks.append(str(txt))
+    return "\n\n".join(chunks)
+
 async def _lexical_fallback_embeddings(q: str, limit: int) -> List[Dict[str, Any]]:
-    """
-    Fallback 1: vector_embeddings.text ILIKE '%q%'
-    """
     if not _SUPABASE:
         return []
     pattern = f"%{(q or '').strip().replace('%','')[:128]}%"
@@ -340,19 +358,14 @@ async def _lexical_fallback_embeddings(q: str, limit: int) -> List[Dict[str, Any
         return []
 
 async def _metadata_probe_exhibits(q: str, limit: int) -> List[str]:
-    """
-    Fallback helper: search exhibits.description/filename ILIKE.
-    Returns list of exhibit_ids.
-    """
     ids: List[str] = []
     if not _SUPABASE:
         return ids
     pattern = f"%{(q or '').strip().replace('%','')[:128]}%"
     try:
-        # description
         r1 = (
             _SUPABASE.table("exhibits")
-            .select("exhibit_id,description")
+            .select("*")
             .ilike("description", pattern)
             .limit(limit * 2)
             .execute()
@@ -361,11 +374,10 @@ async def _metadata_probe_exhibits(q: str, limit: int) -> List[str]:
             eid = _normalize_exhibit_id(rec.get("exhibit_id") or "")
             if eid and eid not in ids:
                 ids.append(eid)
-        # filename
         r2 = (
             _SUPABASE.table("exhibits")
-            .select("exhibit_id,filename")
-            .ilike("filename", pattern)
+            .select("*")
+            .ilike("file_name", pattern)  # schema uses file_name (not filename)
             .limit(limit * 2)
             .execute()
         )
@@ -378,27 +390,16 @@ async def _metadata_probe_exhibits(q: str, limit: int) -> List[str]:
     return ids[: max(1, limit * 2)]
 
 async def _first_page_snippet_for(eid: str) -> str:
-    """
-    Fetches first page/chunk for an exhibit to make a snippet.
-    """
     if not _SUPABASE:
         return ""
     try:
-        q = (
+        r = (
             _SUPABASE.table("vector_embeddings")
-            .select("text,page,chunk_index")
+            .select("text")
             .eq("exhibit_id", _normalize_exhibit_id(eid))
             .limit(1)
+            .execute()
         )
-        try:
-            q = q.order("page")
-        except Exception:
-            pass
-        try:
-            q = q.order("chunk_index")
-        except Exception:
-            pass
-        r = q.execute()
         if r.data:
             return _truncate(r.data[0].get("text") or "")
     except Exception:
@@ -407,80 +408,46 @@ async def _first_page_snippet_for(eid: str) -> str:
 
 async def _fetch_exhibit_pages(exhibit_id: str) -> Tuple[bool, List[str], str]:
     """
-    Returns (ok, pages, error_message).
+    Returns (ok, pages, error_message). Uses Supabase first; EF fallback if empty.
     """
-    if not _SUPABASE:
-        return (False, [], "supabase_client_not_initialized")
     eid = _normalize_exhibit_id(exhibit_id)
+    # Supabase path
+    if _SUPABASE:
+        try:
+            resp = (
+                _SUPABASE.table("vector_embeddings")
+                .select("text,exhibit_id")
+                .eq("exhibit_id", eid)
+                .limit(5000)
+                .execute()
+            )
+            pages: List[str] = []
+            for rec in resp.data or []:
+                t = rec.get("text") or ""
+                if t:
+                    pages.append(t)
+            if pages:
+                return (True, pages[:MAX_FETCH_SIZE], "")
+        except Exception as e:
+            # swallow and try EF fallback
+            print("[BDB] fetch_exhibit Supabase path failed:", e, file=sys.stderr)
+
+    # EF fallback
     try:
-        q = (
-            _SUPABASE.table("vector_embeddings")
-            .select("text,exhibit_id,page,chunk_index")
-            .eq("exhibit_id", eid)
-        )
-        # best-effort ordering
-        try:
-            q = q.order("page")
-        except Exception:
-            pass
-        try:
-            q = q.order("chunk_index")
-        except Exception:
-            pass
-        resp = q.limit(5000).execute()
-        pages: List[str] = []
-        for rec in resp.data or []:
-            t = rec.get("text") or ""
-            if t:
-                pages.append(t)
-        return (True, pages[:MAX_FETCH_SIZE], "")
+        text = await _edge_fetch_exhibit_text(eid, k=2000)
+        if text:
+            return (True, [text], "")
+        return (False, [], "not_found")
     except Exception as e:
-        return (False, [], f"fetch_exhibit_failed: {e}")
-
-# ------------------------------------------------------------------------------
-# Manifest helpers
-# ------------------------------------------------------------------------------
-
-def _manifest_search(query: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Very simple match over manifest fields: exhibit_id, description, filename, title, tags, custodian.
-    Returns list of {id, snippet, score=None}.
-    """
-    if not _MANIFEST or not query:
-        return []
-    q = (query or "").strip().lower()
-    fields = ("exhibit_id","description","filename","title","tags","custodian")
-    hits: List[Tuple[str, str]] = []  # (id, snippet)
-    seen: set = set()
-    for row in _MANIFEST:
-        try:
-            text_parts = []
-            exhibit_id = ""
-            for key in row.keys():
-                lk = key.lower()
-                if lk in fields:
-                    val = str(row.get(key) or "")
-                    text_parts.append(val)
-                    if lk == "exhibit_id" and not exhibit_id:
-                        exhibit_id = val
-            blob = " ".join(text_parts).lower()
-            if q in blob:
-                eid = _normalize_exhibit_id(exhibit_id or "")
-                if eid and eid not in seen:
-                    snippet = row.get("description") or row.get("title") or row.get("filename") or ""
-                    hits.append((eid, snippet))
-                    seen.add(eid)
-            if len(hits) >= limit:
-                break
-        except Exception:
-            continue
-    return [{"id": eid, "snippet": _truncate(sn), "score": None} for (eid, sn) in hits[:limit]]
+        return (False, [], f"edge_fallback_failed: {e}")
 
 # ------------------------------------------------------------------------------
 # MCP server + tools
 # ------------------------------------------------------------------------------
 
-mcp = FastMCP()  # IMPORTANT: no kwargs for 2.12.x compatibility
+mcp = FastMCP()  # IMPORTANT: no kwargs for 2.12.x
+
+# ----------------------------- Utilities & config ------------------------------
 
 @mcp.tool(description="Echo input for debugging.")
 async def echo(text: str) -> Dict[str, Any]:
@@ -501,19 +468,18 @@ async def list_capabilities(payload: Optional[Dict[str, Any]] = None) -> Dict[st
 async def set_defaults(
     mode: Optional[str] = None,
     top_k: Optional[int] = None,
-    limit: Optional[int] = None,            # accept limit too
+    limit: Optional[int] = None,
     min_score: Optional[float] = None,
     lexical_k: Optional[int] = None,
-    payload: Optional[Dict[str, Any]] = None,  # MCP Inspector sometimes supplies this
+    payload: Optional[Dict[str, Any]] = None,  # Inspector sometimes supplies this
 ) -> Dict[str, Any]:
     global SEARCH_MODE, SEARCH_TOP_K, SEARCH_MIN_SCORE, LEXICAL_K
     if mode:
         SEARCH_MODE = mode.lower().strip()
-    # prefer explicit limit if provided
     if limit is not None:
-        SEARCH_TOP_K = int(limit)
+        SEARCH_TOP_K = _as_int(limit, SEARCH_TOP_K)
     if top_k is not None:
-        SEARCH_TOP_K = int(top_k)
+        SEARCH_TOP_K = _as_int(top_k, SEARCH_TOP_K)
     if min_score is not None:
         SEARCH_MIN_SCORE = float(min_score)
     if lexical_k is not None:
@@ -522,7 +488,7 @@ async def set_defaults(
         "mode": SEARCH_MODE, "top_k": SEARCH_TOP_K, "min_score": SEARCH_MIN_SCORE, "lexical_k": LEXICAL_K
     }}
 
-# ----- Search family (robust EF parse + Supabase + manifest fallbacks) ---------
+# ----------------------------- Search family ----------------------------------
 
 @mcp.tool(description="Canonical search: returns `ids` and scored snippets for follow‑up `fetch()`.")
 async def search(
@@ -534,37 +500,30 @@ async def search(
     label: Optional[str] = None,
     metadata_filter: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # 1) Try Edge Function
+    # 1) Edge Function
     base = await _edge_search_core(
-        q=query,
-        mode=mode,
-        top_k=limit,
-        limit=limit,
-        min_score=min_score,
-        rerank=rerank,
-        label=label,
-        metadata_filter=metadata_filter,
+        q=query, mode=mode, top_k=limit, limit=limit, min_score=min_score,
+        rerank=rerank, label=label, metadata_filter=metadata_filter
     )
     items: List[Dict[str, Any]] = []
     if base.get("ok"):
         items = _extract_results_from_edge(base.get("raw", {}) or {})
 
-    # 2) Fallback: lexical within vector_embeddings
+    # 2) Lexical fallback on vector_embeddings.text
     if not items:
-        embeds = await _lexical_fallback_embeddings(query, limit)
-        items.extend(embeds)
+        items.extend(await _lexical_fallback_embeddings(query, _as_int(limit, SEARCH_TOP_K)))
 
-    # 3) Fallback: exhibits metadata probe → first-page snippets
+    # 3) Exhibits metadata probe → first-page snippets
     if not items:
-        eids = await _metadata_probe_exhibits(query, limit)
-        for eid in eids[:limit]:
+        eids = await _metadata_probe_exhibits(query, _as_int(limit, SEARCH_TOP_K))
+        for eid in eids[:_as_int(limit, SEARCH_TOP_K)]:
             snip = await _first_page_snippet_for(eid)
             if snip:
                 items.append({"id": _normalize_exhibit_id(eid), "snippet": snip, "score": None})
 
-    # 4) Fallback: manifest search
-    if not items:
-        items = _manifest_search(query, limit)
+    # 4) Manifest fallback
+    if not items and _MANIFEST:
+        items = _manifest_search(query, _as_int(limit, SEARCH_TOP_K))
 
     # Dedup and cap
     dedup: Dict[str, Dict[str, Any]] = {}
@@ -574,16 +533,16 @@ async def search(
             continue
         if eid not in dedup:
             dedup[eid] = {"id": eid, "snippet": it.get("snippet") or "", "score": it.get("score")}
-    final = list(dedup.values())[:max(1, limit)]
+    final = list(dedup.values())[:max(1, _as_int(limit, SEARCH_TOP_K))]
 
     return {"ok": True, "results": final, "ids": [it["id"] for it in final]}
 
-@mcp.tool(description="Hybrid search via Edge (returns raw edge payload alongside parsed results).")
+@mcp.tool(description="Hybrid search via Edge (returns parsed results and raw payload when diagnostics enabled).")
 async def edge_search(
     q: str,
     mode: Optional[str] = None,
     top_k: Optional[int] = None,
-    limit: Optional[int] = None,            # MCP Inspector passes "limit"
+    limit: Optional[int] = None,
     min_score: Optional[float] = None,
     rerank: Optional[bool] = True,
     label: Optional[str] = None,
@@ -591,11 +550,25 @@ async def edge_search(
 ) -> Dict[str, Any]:
     base = await _edge_search_core(q, mode, top_k, limit, min_score, rerank, label, metadata_filter)
     parsed = _extract_results_from_edge(base.get("raw", {}) or {}) if base.get("ok") else []
-    return {"ok": base.get("ok", False), "status": base.get("status"), "url": base.get("url"),
-            "parsed": parsed, "raw": base.get("raw") if ENABLE_DIAG else {}}
+    return {
+        "ok": base.get("ok", False),
+        "status": base.get("status"),
+        "url": base.get("url"),
+        "parsed": parsed,
+        "raw": base.get("raw") if ENABLE_DIAG else {},
+    }
 
-@mcp.tool(description="Request query embedding from Edge (action=embed_query).")
-async def embed_query(q: str) -> Dict[str, Any]:
+@mcp.tool(description="Request a query embedding from Edge (action=embed_query). Ignores extra args from Inspector.")
+async def embed_query(
+    q: str,
+    mode: Optional[str] = None,
+    label: Optional[str] = None,
+    limit: Optional[int] = None,
+    top_k: Optional[int] = None,
+    rerank: Optional[bool] = None,
+    min_score: Optional[float] = None,
+    metadata_filter: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     edge_url = _resolve_edge_url()
     ok, host = _is_host_allowlisted(edge_url)
     if not ok:
@@ -607,35 +580,39 @@ async def embed_query(q: str) -> Dict[str, Any]:
     emb = data.get("embedding") or data.get("vector") or []
     return {"ok": True, "dim": len(emb), "embedding": emb}
 
-# ----- Spec‑compliant fetch ----------------------------------------------------
+# ----------------------------- Fetch family -----------------------------------
 
 @mcp.tool(description="Fetch a complete record by ID (Deep Research compatible).")
 async def fetch(id: str) -> Dict[str, Any]:
-    ok, pages, err = await _fetch_exhibit_pages(id)
+    eid = _normalize_exhibit_id(id)
+    ok, pages, err = await _fetch_exhibit_pages(eid)
     if not ok:
-        return {"ok": False, "error": err, "id": _normalize_exhibit_id(id), "text": "", "metadata": {}}
+        return {"ok": False, "error": err, "id": eid, "text": "", "metadata": {}}
     text = "\n\n".join(pages)
-    meta: Dict[str, Any] = {"exhibit_id": _normalize_exhibit_id(id)}
+    meta: Dict[str, Any] = {"exhibit_id": eid}
     if _SUPABASE:
         try:
             resp = (
                 _SUPABASE.table("exhibits")
-                .select("description,filename")
-                .eq("exhibit_id", _normalize_exhibit_id(id))
+                .select("*")
+                .eq("exhibit_id", eid)
                 .limit(1)
                 .execute()
             )
             if resp.data:
                 row = resp.data[0] or {}
-                meta.update({k: row.get(k) for k in ("description", "filename") if row.get(k)})
+                # prefer file_name, fallback to filename if present
+                filename = row.get("file_name") or row.get("filename")
+                description = row.get("description")
+                for k, v in (("description", description), ("file_name", filename)):
+                    if v:
+                        meta[k] = v
         except Exception:
             pass
-    title = (meta.get("description") or str(id)).strip()
-    return {"ok": True, "id": _normalize_exhibit_id(id), "title": title, "text": text, "metadata": meta}
+    title = (meta.get("description") or str(eid)).strip()
+    return {"ok": True, "id": eid, "title": title, "text": text, "metadata": meta}
 
-# ----- Additional helpers ------------------------------------------------------
-
-@mcp.tool(description="Retrieve full text pages for an exhibit (server-side PostgREST).")
+@mcp.tool(description="Retrieve full text pages for an exhibit (server-side PostgREST; EF fallback if needed).")
 async def fetch_exhibit(exhibit_id: str) -> Dict[str, Any]:
     ok, pages, err = await _fetch_exhibit_pages(exhibit_id)
     return {"ok": ok, "exhibit_id": _normalize_exhibit_id(exhibit_id), "pages": pages, "error": (None if ok else err)}
@@ -661,21 +638,24 @@ async def list_exhibits(withLabels: bool = False) -> Dict[str, Any]:
     try:
         data = (
             _SUPABASE.table("exhibits")
-            .select("exhibit_id,description,filename")
+            .select("*")
             .limit(5000)
             .execute()
         ).data or []
         if withLabels:
             for rec in data:
-                rec["category"] = _cat(rec.get("description", ""), rec.get("filename", ""))
+                rec["category"] = _cat(rec.get("description", ""), rec.get("file_name", "") or rec.get("filename", ""))
         return {"ok": True, "exhibits": data}
     except Exception as e:
         return {"ok": False, "error": f"list_exhibits_failed: {e}", "exhibits": []}
 
-# ----- Diagnostics (accept loose payloads for MCP Inspector) -------------------
+# ----------------------------- Diagnostics ------------------------------------
 
 @mcp.tool(description="Show config and defaults.")
-async def diag_config(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def diag_config(
+    withLabels: Optional[bool] = None,  # Inspector sometimes sends this
+    payload: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     return {
         "ok": True,
         "server": {"name": SERVER_NAME, "version": SERVER_VERSION, "git_sha": GIT_SHA},
@@ -699,18 +679,18 @@ async def diag_edge(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     status, data, text = await _post_json(edge_url, payload or {"action": "ping", "ping": True}, headers)
     return {"ok": status == 200, "status": status, "url": edge_url, "json": data if data else {}, "text": _truncate(text)}
 
-@mcp.tool(description="Basic health check (accepts optional text/message/payload).")
+@mcp.tool(description="Basic health check (accepts loose args).")
 async def health(
     text: Optional[str] = None,
     message: Optional[str] = None,
-    input: Optional[str] = None,                  # some inspectors send 'input'
+    input: Optional[str] = None,
     prompt: Optional[str] = None,
     payload: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {"ok": True, "server": SERVER_NAME, "version": SERVER_VERSION, "git_sha": GIT_SHA}
 
 # ------------------------------------------------------------------------------
-# Extra HTTP routes (/ and /health)
+# HTTP routes (/ and /health) + MCP mount at /mcp (no shims; fail loudly)
 # ------------------------------------------------------------------------------
 
 async def _root_ok(request: Request):
@@ -753,11 +733,7 @@ async def _health_get(request: Request):
         "ok": True,
         "server": {"name": SERVER_NAME, "version": SERVER_VERSION, "git_sha": GIT_SHA},
         "edge": {"url": _resolve_edge_url(), "status": edge_status, "allowlisted": _is_host_allowlisted(_resolve_edge_url())[0]},
-        "supabase": {
-            "url_set": bool(SUPABASE_URL),
-            "auth_status": auth_status,
-            "rest_status": rest_status,
-        },
+        "supabase": {"url_set": bool(SUPABASE_URL), "auth_status": auth_status, "rest_status": rest_status},
         "allowlist_hosts": ALLOWLIST_HOSTS,
         "manifest_rows": len(_MANIFEST),
     })
@@ -770,22 +746,19 @@ _routes = [
     Route("/health", endpoint=_health_get, methods=["GET"]),
     Route("/health", endpoint=_health_head, methods=["HEAD"]),
 ]
+
 _middleware = [
     Middleware(
         CORSMiddleware,
-        allow_origins=[CORS_ALLOWED_ORIGINS] if CORS_ALLOWED_ORIGINS != "*" else ["*"],
+        allow_origins=["*"] if CORS_ALLOWED_ORIGINS == "*" else [CORS_ALLOWED_ORIGINS],
         allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
         allow_headers=["Content-Type", "Authorization", "Accept", "Origin"],
     ),
 ]
 
-# Build streamable HTTP app mounted at /mcp (no shims; fail loudly on import errors)
-app = create_streamable_http_app(
-    mcp,
-    streamable_http_path=MCP_PATH,
-    routes=_routes,
-    middleware=_middleware,
-)
+# Build Starlette app and mount the MCP HTTP app at /mcp
+mcp_http = mcp.http_app()  # per canonical fact: use http_app() and mount at /mcp
+app = Starlette(routes=[Mount(MCP_PATH, app=mcp_http), *_routes], middleware=_middleware)
 
 # Local dev convenience
 if __name__ == "__main__":
