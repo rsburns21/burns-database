@@ -1,5 +1,5 @@
 # server.py
-# Burns Database MCP Server — Streamable HTTP + Supabase Edge / PostgREST
+# Burns Database MCP Server — Streamable HTTP + Supabase Edge / PostgREST + optional manifest fallback
 # Compatible with fastmcp 2.12.x (instantiate FastMCP() with no kwargs)
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import csv
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -36,7 +37,7 @@ except Exception as e:
 # ------------------------------------------------------------------------------
 
 SERVER_NAME = os.getenv("APP_NAME", "BDB").strip()
-SERVER_VERSION = os.getenv("APP_VERSION", "6.2").strip()
+SERVER_VERSION = os.getenv("APP_VERSION", "6.3").strip()
 GIT_SHA = os.getenv("GIT_SHA", "").strip()
 MCP_PATH = "/mcp"  # mount path
 
@@ -57,6 +58,10 @@ EDGEFN_URL = os.getenv(
 ).strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+# Optional manifest (CSV) mapping exhibits; either PATH or URL
+MANIFEST_PATH = os.getenv("MANIFEST_PATH", "").strip()
+MANIFEST_URL = os.getenv("MANIFEST_URL", "").strip()
 
 ALLOWLIST_DEFAULT = [
     "nqkzqcsqfvpquticvwmk.supabase.co",
@@ -100,13 +105,10 @@ else:
         print("[BDB] Supabase client not initialized (missing SUPABASE_URL or SERVICE_ROLE_KEY).", file=sys.stderr)
 
 # ------------------------------------------------------------------------------
-# Helpers
+# Manifest (optional)
 # ------------------------------------------------------------------------------
 
-def _truncate(s: str, n: int = SNIPPET_LENGTH) -> str:
-    if not s:
-        return ""
-    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+_MANIFEST: List[Dict[str, Any]] = []
 
 def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
     try:
@@ -115,6 +117,63 @@ def _is_host_allowlisted(url: str) -> Tuple[bool, str]:
         return (host in ALLOWLIST_HOSTS, host)
     except Exception:
         return (False, "")
+
+def _load_manifest() -> None:
+    global _MANIFEST
+    try:
+        if MANIFEST_PATH and os.path.exists(MANIFEST_PATH):
+            with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+                _manifest_from_csv(f.read())
+                print(f"[BDB] Manifest loaded from file: {MANIFEST_PATH} ({len(_MANIFEST)} rows)", file=sys.stderr)
+                return
+        if MANIFEST_URL:
+            ok, host = _is_host_allowlisted(MANIFEST_URL)
+            if not ok:
+                print(f"[BDB] Manifest URL host not allowlisted: {host}", file=sys.stderr)
+                return
+            try:
+                import asyncio
+                async def _fetch():
+                    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
+                        r = await client.get(MANIFEST_URL, headers={"Accept": "text/csv"})
+                        r.raise_for_status()
+                        return r.text
+                text = asyncio.get_event_loop().run_until_complete(_fetch())
+            except RuntimeError:
+                # If event loop is already running (some platforms), do a simple sync fallback
+                with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
+                    r = client.get(MANIFEST_URL, headers={"Accept": "text/csv"})
+                    r.raise_for_status()
+                    text = r.text
+            _manifest_from_csv(text)
+            print(f"[BDB] Manifest loaded from URL: {MANIFEST_URL} ({len(_MANIFEST)} rows)", file=sys.stderr)
+    except Exception as e:
+        print("[BDB] Manifest load failed:", e, file=sys.stderr)
+
+def _manifest_from_csv(text: str) -> None:
+    global _MANIFEST
+    _MANIFEST = []
+    if not text:
+        return
+    try:
+        reader = csv.DictReader(text.splitlines())
+        for row in reader:
+            # normalize keys
+            nrow = { (k.strip() if k else k): (v.strip() if isinstance(v, str) else v) for k,v in row.items() }
+            _MANIFEST.append(nrow)
+    except Exception as e:
+        print("[BDB] Manifest parse failed:", e, file=sys.stderr)
+
+_load_manifest()
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+
+def _truncate(s: str, n: int = SNIPPET_LENGTH) -> str:
+    if not s:
+        return ""
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
 def make_edge_headers() -> Dict[str, str]:
     headers: Dict[str, str] = {"Content-Type": "application/json"}
@@ -161,7 +220,7 @@ def _prefer_list(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         v = d.get(k)
         if isinstance(v, list):
             return v
-    # sometimes wrapped one deeper
+    # nested one deeper
     for v in d.values():
         if isinstance(v, dict):
             lst = _prefer_list(v)
@@ -173,7 +232,7 @@ def _get_first(d: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[Any]:
     for k in keys:
         if k in d and d[k] not in (None, ""):
             return d[k]
-    # try case/format variants
+    # case-insensitive fallback
     for k in list(d.keys()):
         lk = k.lower()
         for key in keys:
@@ -192,8 +251,8 @@ def _extract_results_from_edge(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         rid = _normalize_exhibit_id(str(rid))
         snippet = _get_first(r, _SNIPPET_KEYS) or ""
-        score = _get_first(r, _ SCORE_KEYS)
-        # distance -> convert to "similarity-like" if present
+        score = _get_first(r, _SCORE_KEYS)
+        # distance -> convert to similarity-ish
         if score is None and "distance" in r:
             try:
                 dist = float(r.get("distance"))
@@ -214,6 +273,7 @@ async def _edge_search_core(
     q: str,
     mode: Optional[str] = None,
     top_k: Optional[int] = None,
+    limit: Optional[int] = None,          # accept both names; MCP Inspector uses "limit"
     min_score: Optional[float] = None,
     rerank: Optional[bool] = True,
     label: Optional[str] = None,
@@ -225,7 +285,7 @@ async def _edge_search_core(
         return {"ok": False, "error": f"host '{host}' not in allowlist", "url": edge_url}
 
     m = (mode or SEARCH_MODE).lower()
-    k = int(top_k or SEARCH_TOP_K)
+    k = int(limit if limit is not None else (top_k if top_k is not None else SEARCH_TOP_K))
 
     # Build liberal body (tolerates different EF parameter names)
     body: Dict[str, Any] = {
@@ -378,6 +438,45 @@ async def _fetch_exhibit_pages(exhibit_id: str) -> Tuple[bool, List[str], str]:
         return (False, [], f"fetch_exhibit_failed: {e}")
 
 # ------------------------------------------------------------------------------
+# Manifest helpers
+# ------------------------------------------------------------------------------
+
+def _manifest_search(query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Very simple match over manifest fields: exhibit_id, description, filename, title, tags, custodian.
+    Returns list of {id, snippet, score=None}.
+    """
+    if not _MANIFEST or not query:
+        return []
+    q = (query or "").strip().lower()
+    fields = ("exhibit_id","description","filename","title","tags","custodian")
+    hits: List[Tuple[str, str]] = []  # (id, snippet)
+    seen: set = set()
+    for row in _MANIFEST:
+        try:
+            text_parts = []
+            exhibit_id = ""
+            for key in row.keys():
+                lk = key.lower()
+                if lk in fields:
+                    val = str(row.get(key) or "")
+                    text_parts.append(val)
+                    if lk == "exhibit_id" and not exhibit_id:
+                        exhibit_id = val
+            blob = " ".join(text_parts).lower()
+            if q in blob:
+                eid = _normalize_exhibit_id(exhibit_id or "")
+                if eid and eid not in seen:
+                    snippet = row.get("description") or row.get("title") or row.get("filename") or ""
+                    hits.append((eid, snippet))
+                    seen.add(eid)
+            if len(hits) >= limit:
+                break
+        except Exception:
+            continue
+    return [{"id": eid, "snippet": _truncate(sn), "score": None} for (eid, sn) in hits[:limit]]
+
+# ------------------------------------------------------------------------------
 # MCP server + tools
 # ------------------------------------------------------------------------------
 
@@ -395,18 +494,24 @@ async def list_capabilities(payload: Optional[Dict[str, Any]] = None) -> Dict[st
         "transport": "http_streamable",
         "stateless_http": True,
         "allowlist_hosts": ALLOWLIST_HOSTS,
+        "manifest_rows": len(_MANIFEST),
     }
 
 @mcp.tool(description="Adjust default search behavior.")
 async def set_defaults(
     mode: Optional[str] = None,
     top_k: Optional[int] = None,
+    limit: Optional[int] = None,            # accept limit too
     min_score: Optional[float] = None,
     lexical_k: Optional[int] = None,
+    payload: Optional[Dict[str, Any]] = None,  # MCP Inspector sometimes supplies this
 ) -> Dict[str, Any]:
     global SEARCH_MODE, SEARCH_TOP_K, SEARCH_MIN_SCORE, LEXICAL_K
     if mode:
         SEARCH_MODE = mode.lower().strip()
+    # prefer explicit limit if provided
+    if limit is not None:
+        SEARCH_TOP_K = int(limit)
     if top_k is not None:
         SEARCH_TOP_K = int(top_k)
     if min_score is not None:
@@ -417,7 +522,7 @@ async def set_defaults(
         "mode": SEARCH_MODE, "top_k": SEARCH_TOP_K, "min_score": SEARCH_MIN_SCORE, "lexical_k": LEXICAL_K
     }}
 
-# ----- Search family (robust EF parse + Supabase fallbacks) --------------------
+# ----- Search family (robust EF parse + Supabase + manifest fallbacks) ---------
 
 @mcp.tool(description="Canonical search: returns `ids` and scored snippets for follow‑up `fetch()`.")
 async def search(
@@ -434,6 +539,7 @@ async def search(
         q=query,
         mode=mode,
         top_k=limit,
+        limit=limit,
         min_score=min_score,
         rerank=rerank,
         label=label,
@@ -456,6 +562,10 @@ async def search(
             if snip:
                 items.append({"id": _normalize_exhibit_id(eid), "snippet": snip, "score": None})
 
+    # 4) Fallback: manifest search
+    if not items:
+        items = _manifest_search(query, limit)
+
     # Dedup and cap
     dedup: Dict[str, Dict[str, Any]] = {}
     for it in items:
@@ -473,12 +583,13 @@ async def edge_search(
     q: str,
     mode: Optional[str] = None,
     top_k: Optional[int] = None,
+    limit: Optional[int] = None,            # MCP Inspector passes "limit"
     min_score: Optional[float] = None,
     rerank: Optional[bool] = True,
     label: Optional[str] = None,
     metadata_filter: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    base = await _edge_search_core(q, mode, top_k, min_score, rerank, label, metadata_filter)
+    base = await _edge_search_core(q, mode, top_k, limit, min_score, rerank, label, metadata_filter)
     parsed = _extract_results_from_edge(base.get("raw", {}) or {}) if base.get("ok") else []
     return {"ok": base.get("ok", False), "status": base.get("status"), "url": base.get("url"),
             "parsed": parsed, "raw": base.get("raw") if ENABLE_DIAG else {}}
@@ -572,6 +683,7 @@ async def diag_config(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         "allowlist_hosts": ALLOWLIST_HOSTS,
         "supabase_url_set": bool(SUPABASE_URL),
         "openai_key_set": bool(OPENAI_API_KEY),
+        "manifest_rows": len(_MANIFEST),
         "defaults": {"mode": SEARCH_MODE, "top_k": SEARCH_TOP_K, "min_score": SEARCH_MIN_SCORE, "lexical_k": LEXICAL_K},
         "stateless_http": True,
         "enable_diag": ENABLE_DIAG,
@@ -587,8 +699,14 @@ async def diag_edge(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     status, data, text = await _post_json(edge_url, payload or {"action": "ping", "ping": True}, headers)
     return {"ok": status == 200, "status": status, "url": edge_url, "json": data if data else {}, "text": _truncate(text)}
 
-@mcp.tool(description="Basic health check (accepts optional message/payload).")
-async def health(message: Optional[str] = None, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+@mcp.tool(description="Basic health check (accepts optional text/message/payload).")
+async def health(
+    text: Optional[str] = None,
+    message: Optional[str] = None,
+    input: Optional[str] = None,                  # some inspectors send 'input'
+    prompt: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     return {"ok": True, "server": SERVER_NAME, "version": SERVER_VERSION, "git_sha": GIT_SHA}
 
 # ------------------------------------------------------------------------------
@@ -598,7 +716,7 @@ async def health(message: Optional[str] = None, payload: Optional[Dict[str, Any]
 async def _root_ok(request: Request):
     return JSONResponse({
         "ok": True, "name": SERVER_NAME, "version": SERVER_VERSION, "git_sha": GIT_SHA,
-        "ts": int(time.time()), "mcp_path": MCP_PATH
+        "ts": int(time.time()), "mcp_path": MCP_PATH, "manifest_rows": len(_MANIFEST)
     })
 
 async def _health_get(request: Request):
@@ -641,6 +759,7 @@ async def _health_get(request: Request):
             "rest_status": rest_status,
         },
         "allowlist_hosts": ALLOWLIST_HOSTS,
+        "manifest_rows": len(_MANIFEST),
     })
 
 async def _health_head(request: Request):
