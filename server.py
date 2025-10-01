@@ -1,6 +1,6 @@
 # server.py
 # Burns Database MCP Server — Streamable HTTP + Supabase Edge / PostgREST
-# Compatible with fastmcp 2.12.x (no server_name/server_version kwargs in FastMCP.__init__)
+# Compatible with fastmcp 2.12.x (instantiate FastMCP() with no kwargs)
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-import asyncio
 import httpx
 
 # FastMCP
@@ -37,7 +36,7 @@ except Exception as e:
 # ------------------------------------------------------------------------------
 
 SERVER_NAME = os.getenv("APP_NAME", "BDB").strip()
-SERVER_VERSION = os.getenv("APP_VERSION", "6.1").strip()
+SERVER_VERSION = os.getenv("APP_VERSION", "6.2").strip()
 GIT_SHA = os.getenv("GIT_SHA", "").strip()
 MCP_PATH = "/mcp"  # mount path
 
@@ -144,19 +143,65 @@ def _normalize_exhibit_id(eid: str) -> str:
         return f"Ex{int(s[2:]):03d}"
     return s
 
-def _categorize_exhibit(description: str, filename: str = "") -> str:
-    t = (description or "").lower() + " " + (filename or "").lower()
-    if any(k in t for k in ("contract", "agreement", "msa", "sow")):
-        return "KEY_CONTRACT"
-    if any(k in t for k in ("email", "correspondence", "thread", "inbox")):
-        return "CORRESPONDENCE"
-    if any(k in t for k in ("invoice", "statement", "bank", "wire", "payment")):
-        return "FINANCIAL"
-    if any(k in t for k in ("technical", "spec", "design", "architecture", "diagram")):
-        return "TECHNICAL"
-    if any(k in t for k in ("image", "photo", "screenshot", "media", "audio", "video")):
-        return "MEDIA"
-    return "OTHER"
+# --- Edge result parsing (robust across shapes) --------------------------------
+
+_ID_KEYS = (
+    "exhibit_id", "exhibitId", "id", "doc_id", "document_id", "documentId",
+    "key", "pk", "uuid"
+)
+_SNIPPET_KEYS = (
+    "snippet", "text", "chunk", "content", "passage", "preview", "summary"
+)
+_SCORE_KEYS = ("score", "similarity", "relevance", "rank", "distance")
+
+def _prefer_list(d: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not isinstance(d, dict):
+        return []
+    for k in ("results", "matches", "hits", "items", "data", "documents", "docs", "rows", "records"):
+        v = d.get(k)
+        if isinstance(v, list):
+            return v
+    # sometimes wrapped one deeper
+    for v in d.values():
+        if isinstance(v, dict):
+            lst = _prefer_list(v)
+            if lst:
+                return lst
+    return []
+
+def _get_first(d: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[Any]:
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    # try case/format variants
+    for k in list(d.keys()):
+        lk = k.lower()
+        for key in keys:
+            if lk == key.lower():
+                return d[k]
+    return None
+
+def _extract_results_from_edge(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    items = _prefer_list(payload)
+    for r in items:
+        if not isinstance(r, dict):
+            continue
+        rid = _get_first(r, _ID_KEYS)
+        if not rid:
+            continue
+        rid = _normalize_exhibit_id(str(rid))
+        snippet = _get_first(r, _SNIPPET_KEYS) or ""
+        score = _get_first(r, _ SCORE_KEYS)
+        # distance -> convert to "similarity-like" if present
+        if score is None and "distance" in r:
+            try:
+                dist = float(r.get("distance"))
+                score = 1.0 - dist
+            except Exception:
+                score = None
+        out.append({"id": rid, "snippet": _truncate(str(snippet)), "score": score})
+    return out
 
 # ------------------------------------------------------------------------------
 # Retrieval core (no decorators here)
@@ -181,22 +226,24 @@ async def _edge_search_core(
 
     m = (mode or SEARCH_MODE).lower()
     k = int(top_k or SEARCH_TOP_K)
+
+    # Build liberal body (tolerates different EF parameter names)
     body: Dict[str, Any] = {
+        "action": "search",
         "query": q,
         "q": q,
         "mode": m,
         "searchType": m,
-        "k": k,
-        "topK": k,
-        "limit": k,
+        "k": k, "topK": k, "limit": k,
         "min_score": float(min_score if min_score is not None else SEARCH_MIN_SCORE),
-        "lexical_k": LEXICAL_K,
+        "lexical_k": LEXICAL_K, "lexicalK": LEXICAL_K,
         "rerank": bool(rerank),
     }
     if label:
         body["label"] = label
     if metadata_filter:
         body["filter"] = metadata_filter
+        body["filters"] = metadata_filter
 
     headers = make_edge_headers()
     status, data, text = await _post_json(edge_url, body, headers)
@@ -206,6 +253,97 @@ async def _edge_search_core(
         return out
     out["raw"] = data
     return out
+
+async def _lexical_fallback_embeddings(q: str, limit: int) -> List[Dict[str, Any]]:
+    """
+    Fallback 1: vector_embeddings.text ILIKE '%q%'
+    """
+    if not _SUPABASE:
+        return []
+    pattern = f"%{(q or '').strip().replace('%','')[:128]}%"
+    try:
+        resp = (
+            _SUPABASE.table("vector_embeddings")
+            .select("exhibit_id,text")
+            .ilike("text", pattern)
+            .limit(limit)
+            .execute()
+        )
+        out: List[Dict[str, Any]] = []
+        for rec in resp.data or []:
+            eid = _normalize_exhibit_id(rec.get("exhibit_id") or "")
+            snip = _truncate(rec.get("text") or "")
+            out.append({"id": eid, "snippet": snip, "score": None})
+        return out
+    except Exception as e:
+        print("[BDB] lexical fallback embeddings failed:", e, file=sys.stderr)
+        return []
+
+async def _metadata_probe_exhibits(q: str, limit: int) -> List[str]:
+    """
+    Fallback helper: search exhibits.description/filename ILIKE.
+    Returns list of exhibit_ids.
+    """
+    ids: List[str] = []
+    if not _SUPABASE:
+        return ids
+    pattern = f"%{(q or '').strip().replace('%','')[:128]}%"
+    try:
+        # description
+        r1 = (
+            _SUPABASE.table("exhibits")
+            .select("exhibit_id,description")
+            .ilike("description", pattern)
+            .limit(limit * 2)
+            .execute()
+        )
+        for rec in (r1.data or []):
+            eid = _normalize_exhibit_id(rec.get("exhibit_id") or "")
+            if eid and eid not in ids:
+                ids.append(eid)
+        # filename
+        r2 = (
+            _SUPABASE.table("exhibits")
+            .select("exhibit_id,filename")
+            .ilike("filename", pattern)
+            .limit(limit * 2)
+            .execute()
+        )
+        for rec in (r2.data or []):
+            eid = _normalize_exhibit_id(rec.get("exhibit_id") or "")
+            if eid and eid not in ids:
+                ids.append(eid)
+    except Exception as e:
+        print("[BDB] exhibits metadata probe failed:", e, file=sys.stderr)
+    return ids[: max(1, limit * 2)]
+
+async def _first_page_snippet_for(eid: str) -> str:
+    """
+    Fetches first page/chunk for an exhibit to make a snippet.
+    """
+    if not _SUPABASE:
+        return ""
+    try:
+        q = (
+            _SUPABASE.table("vector_embeddings")
+            .select("text,page,chunk_index")
+            .eq("exhibit_id", _normalize_exhibit_id(eid))
+            .limit(1)
+        )
+        try:
+            q = q.order("page")
+        except Exception:
+            pass
+        try:
+            q = q.order("chunk_index")
+        except Exception:
+            pass
+        r = q.execute()
+        if r.data:
+            return _truncate(r.data[0].get("text") or "")
+    except Exception:
+        pass
+    return ""
 
 async def _fetch_exhibit_pages(exhibit_id: str) -> Tuple[bool, List[str], str]:
     """
@@ -243,7 +381,7 @@ async def _fetch_exhibit_pages(exhibit_id: str) -> Tuple[bool, List[str], str]:
 # MCP server + tools
 # ------------------------------------------------------------------------------
 
-mcp = FastMCP()  # IMPORTANT: no kwargs for 2.12.0 compatibility
+mcp = FastMCP()  # IMPORTANT: no kwargs for 2.12.x compatibility
 
 @mcp.tool(description="Echo input for debugging.")
 async def echo(text: str) -> Dict[str, Any]:
@@ -279,7 +417,7 @@ async def set_defaults(
         "mode": SEARCH_MODE, "top_k": SEARCH_TOP_K, "min_score": SEARCH_MIN_SCORE, "lexical_k": LEXICAL_K
     }}
 
-# ----- Search family (use private helpers; DO NOT call decorated tools) -----
+# ----- Search family (robust EF parse + Supabase fallbacks) --------------------
 
 @mcp.tool(description="Canonical search: returns `ids` and scored snippets for follow‑up `fetch()`.")
 async def search(
@@ -291,6 +429,7 @@ async def search(
     label: Optional[str] = None,
     metadata_filter: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    # 1) Try Edge Function
     base = await _edge_search_core(
         q=query,
         mode=mode,
@@ -302,34 +441,34 @@ async def search(
     )
     items: List[Dict[str, Any]] = []
     if base.get("ok"):
-        for r in (base.get("raw", {}) or {}).get("results", []) or []:
-            ex_id = r.get("exhibit_id") or r.get("id") or _normalize_exhibit_id(r.get("doc_id", "") or "")
-            if not ex_id:
-                continue
-            snippet = _truncate(r.get("snippet") or r.get("text") or r.get("chunk") or r.get("content") or "")
-            score = r.get("score") or r.get("similarity")
-            items.append({"id": _normalize_exhibit_id(ex_id), "snippet": snippet, "score": score})
+        items = _extract_results_from_edge(base.get("raw", {}) or {})
 
-    # Lexical fallback if nothing returned and PostgREST is available
-    if not items and _SUPABASE:
-        try:
-            resp = (
-                _SUPABASE.table("vector_embeddings")
-                .select("exhibit_id,text")
-                .text_search("text", query)
-                .limit(limit)
-                .execute()
-            )
-            for rec in resp.data or []:
-                ex_id = _normalize_exhibit_id(rec.get("exhibit_id") or "")
-                snippet = _truncate(rec.get("text") or "")
-                items.append({"id": ex_id, "snippet": snippet, "score": None})
-        except Exception as e:
-            return {"ok": False, "error": f"lexical_fallback_failed: {e}"}
+    # 2) Fallback: lexical within vector_embeddings
+    if not items:
+        embeds = await _lexical_fallback_embeddings(query, limit)
+        items.extend(embeds)
 
-    return {"ok": True, "results": items, "ids": [it["id"] for it in items]}
+    # 3) Fallback: exhibits metadata probe → first-page snippets
+    if not items:
+        eids = await _metadata_probe_exhibits(query, limit)
+        for eid in eids[:limit]:
+            snip = await _first_page_snippet_for(eid)
+            if snip:
+                items.append({"id": _normalize_exhibit_id(eid), "snippet": snip, "score": None})
 
-@mcp.tool(description="Hybrid search via Edge (explicit control of params).")
+    # Dedup and cap
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        eid = _normalize_exhibit_id(it.get("id") or "")
+        if not eid:
+            continue
+        if eid not in dedup:
+            dedup[eid] = {"id": eid, "snippet": it.get("snippet") or "", "score": it.get("score")}
+    final = list(dedup.values())[:max(1, limit)]
+
+    return {"ok": True, "results": final, "ids": [it["id"] for it in final]}
+
+@mcp.tool(description="Hybrid search via Edge (returns raw edge payload alongside parsed results).")
 async def edge_search(
     q: str,
     mode: Optional[str] = None,
@@ -339,7 +478,10 @@ async def edge_search(
     label: Optional[str] = None,
     metadata_filter: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return await _edge_search_core(q, mode, top_k, min_score, rerank, label, metadata_filter)
+    base = await _edge_search_core(q, mode, top_k, min_score, rerank, label, metadata_filter)
+    parsed = _extract_results_from_edge(base.get("raw", {}) or {}) if base.get("ok") else []
+    return {"ok": base.get("ok", False), "status": base.get("status"), "url": base.get("url"),
+            "parsed": parsed, "raw": base.get("raw") if ENABLE_DIAG else {}}
 
 @mcp.tool(description="Request query embedding from Edge (action=embed_query).")
 async def embed_query(q: str) -> Dict[str, Any]:
@@ -354,7 +496,7 @@ async def embed_query(q: str) -> Dict[str, Any]:
     emb = data.get("embedding") or data.get("vector") or []
     return {"ok": True, "dim": len(emb), "embedding": emb}
 
-# ----- Spec‑compliant fetch -----
+# ----- Spec‑compliant fetch ----------------------------------------------------
 
 @mcp.tool(description="Fetch a complete record by ID (Deep Research compatible).")
 async def fetch(id: str) -> Dict[str, Any]:
@@ -380,7 +522,7 @@ async def fetch(id: str) -> Dict[str, Any]:
     title = (meta.get("description") or str(id)).strip()
     return {"ok": True, "id": _normalize_exhibit_id(id), "title": title, "text": text, "metadata": meta}
 
-# ----- Additional helpers -----
+# ----- Additional helpers ------------------------------------------------------
 
 @mcp.tool(description="Retrieve full text pages for an exhibit (server-side PostgREST).")
 async def fetch_exhibit(exhibit_id: str) -> Dict[str, Any]:
@@ -389,6 +531,20 @@ async def fetch_exhibit(exhibit_id: str) -> Dict[str, Any]:
 
 @mcp.tool(description="List exhibits; optionally attach simple categories.")
 async def list_exhibits(withLabels: bool = False) -> Dict[str, Any]:
+    def _cat(desc: str, fn: str = "") -> str:
+        t = (desc or "").lower() + " " + (fn or "").lower()
+        if any(k in t for k in ("contract", "agreement", "msa", "sow")):
+            return "KEY_CONTRACT"
+        if any(k in t for k in ("email", "correspondence", "thread", "inbox")):
+            return "CORRESPONDENCE"
+        if any(k in t for k in ("invoice", "statement", "bank", "wire", "payment")):
+            return "FINANCIAL"
+        if any(k in t for k in ("technical", "spec", "design", "architecture", "diagram")):
+            return "TECHNICAL"
+        if any(k in t for k in ("image", "photo", "screenshot", "media", "audio", "video")):
+            return "MEDIA"
+        return "OTHER"
+
     if not _SUPABASE:
         return {"ok": False, "error": "supabase_client_not_initialized", "exhibits": []}
     try:
@@ -400,39 +556,12 @@ async def list_exhibits(withLabels: bool = False) -> Dict[str, Any]:
         ).data or []
         if withLabels:
             for rec in data:
-                rec["category"] = _categorize_exhibit(rec.get("description", ""), rec.get("filename", ""))
+                rec["category"] = _cat(rec.get("description", ""), rec.get("filename", ""))
         return {"ok": True, "exhibits": data}
     except Exception as e:
         return {"ok": False, "error": f"list_exhibits_failed: {e}", "exhibits": []}
 
-@mcp.tool(description="Derive simple legal-discovery labels for results.")
-async def label_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    labeled: List[Dict[str, Any]] = []
-    for r in results or []:
-        ex = r.get("exhibit_id") or r.get("id") or ""
-        desc, fname = "", ""
-        if _SUPABASE and ex:
-            try:
-                resp = (
-                    _SUPABASE.table("exhibits")
-                    .select("description,filename")
-                    .eq("exhibit_id", _normalize_exhibit_id(ex))
-                    .limit(1)
-                    .execute()
-                )
-                if resp.data:
-                    rec = resp.data[0] or {}
-                    desc = rec.get("description") or ""
-                    fname = rec.get("filename") or ""
-            except Exception:
-                pass
-        label = _categorize_exhibit(desc or r.get("snippet", ""), fname)
-        lr = dict(r)
-        lr["category"] = label
-        labeled.append(lr)
-    return {"ok": True, "results": labeled}
-
-# ----- Diagnostics (accept loose payloads to satisfy MCP Inspector) -----
+# ----- Diagnostics (accept loose payloads for MCP Inspector) -------------------
 
 @mcp.tool(description="Show config and defaults.")
 async def diag_config(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
